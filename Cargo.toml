@@ -1,0 +1,13 @@
+[package]
+name = "bliss-guidance-lastfm"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+description = "Last.fm guidance addon for Bliss playlist optimization"
+repository = "https://github.com/chrober/bliss-guidance-lastfm"
+publish = false
+
+[dependencies]
+bliss-playlist-guidance-spi = { path = "../bliss-playlist-guidance-spi" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
