@@ -171,13 +171,21 @@ impl Provider {
                 retryable: false,
             };
         }
-        let source_ids: Vec<&str> = [
-            context.left_anchor_id.as_deref(),
-            context.right_anchor_id.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let mut source_ids = context
+            .context_track_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        source_ids.extend(
+            [
+                context.left_anchor_id.as_deref(),
+                context.right_anchor_id.as_deref(),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+        source_ids.sort_unstable();
+        source_ids.dedup();
         let mut signals = Vec::new();
         for candidate in candidates {
             let mut best_by_channel: BTreeMap<String, (f64, f64, String, Option<String>)> =
@@ -435,6 +443,52 @@ mod tests {
             }
             other => panic!("expected scores response, got {other:?}"),
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn score_uses_global_context_track_ids_when_no_edge_anchor_is_set() {
+        let path = fixture_path();
+        let artifact = serde_json::json!({
+            "schema_version": 1,
+            "edges": [{
+                "source": {"kind": "artist", "id": "source-b"},
+                "resolved_candidate_id": "candidate-1",
+                "raw_score": 0.8,
+                "identity_confidence": 1.0
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+
+        let mut provider = Provider::default();
+        provider
+            .prepare(&[artifact_descriptor(&path)], &[])
+            .unwrap();
+        let response = provider.score(
+            "request-global",
+            &bliss_playlist_guidance_spi::ScoreContext {
+                scope: GuidanceScope::Global,
+                left_anchor_id: None,
+                right_anchor_id: None,
+                context_track_ids: vec!["source-a".to_owned(), "source-b".to_owned()],
+            },
+            &[Candidate {
+                candidate_id: "candidate-1".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: None,
+                artist: None,
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            }],
+        );
+
+        let GuidanceResponse::Scores { signals, .. } = response else {
+            panic!("expected scores response");
+        };
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].channel, "lastfm_artist");
         let _ = fs::remove_file(path);
     }
 
