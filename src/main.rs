@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use bliss_playlist_guidance_spi::{
-    encode, ArtifactDescriptor, Candidate, Capability, Diagnostics, GuidanceRequest,
-    GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, PROTOCOL_NAME, SPI_VERSION,
+    encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
+    GuidanceRequest, GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, PROTOCOL_NAME,
+    SPI_VERSION,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -68,6 +69,16 @@ impl Provider {
             provider_version: PROVIDER_VERSION.to_owned(),
             protocol: PROTOCOL_NAME.to_owned(),
             capabilities: vec![Capability::EdgeCandidateGuidance],
+            channels: vec![
+                ChannelDescriptor {
+                    channel: "lastfm_track".to_owned(),
+                    scopes: vec![GuidanceScope::Edge, GuidanceScope::Global],
+                },
+                ChannelDescriptor {
+                    channel: "lastfm_artist".to_owned(),
+                    scopes: vec![GuidanceScope::Edge, GuidanceScope::Global],
+                },
+            ],
             required_context: vec!["candidate_identity".to_owned(), "route_context".to_owned()],
             configuration_schema: Some(serde_json::json!({
                 "type": "object",
@@ -391,6 +402,14 @@ mod tests {
         assert_eq!(
             manifest.capabilities,
             vec![Capability::EdgeCandidateGuidance]
+        );
+        assert_eq!(
+            manifest
+                .channels
+                .iter()
+                .map(|channel| channel.channel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lastfm_track", "lastfm_artist"]
         );
     }
 
