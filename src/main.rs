@@ -236,7 +236,7 @@ impl Provider {
                     GuidanceSignal {
                         candidate_id: candidate.candidate_id.clone(),
                         channel,
-                        scope: GuidanceScope::Edge,
+                        scope: context.scope.clone(),
                         score: score.clamp(0.0, 1.0),
                         confidence: confidence.clamp(0.0, 1.0),
                         rationale: Some(format!("Last.fm similar {kind}")),
@@ -514,6 +514,7 @@ mod tests {
         };
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].channel, "lastfm_artist");
+        assert_eq!(signals[0].scope, GuidanceScope::Global);
         let _ = fs::remove_file(path);
     }
 
