@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use bliss_playlist_guidance_spi::{
-    encode, Candidate, Capability, Diagnostics, GuidanceRequest, GuidanceResponse, GuidanceScope,
-    GuidanceSignal, Manifest, PROTOCOL_NAME, SPI_VERSION,
+    encode, ArtifactDescriptor, Candidate, Capability, Diagnostics, GuidanceRequest,
+    GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, PROTOCOL_NAME, SPI_VERSION,
 };
 use serde::Deserialize;
-use serde_json::Value;
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{self, BufRead, Write};
 
@@ -46,8 +46,8 @@ fn default_confidence() -> f64 {
 
 #[derive(Default)]
 struct Provider {
-    // Source entity id -> candidate id -> (support, confidence, rationale).
-    edges: HashMap<String, HashMap<String, EdgeScore>>,
+    // Source entity id -> candidate id -> channel -> strongest relation.
+    edges: HashMap<String, HashMap<String, BTreeMap<String, EdgeScore>>>,
     snapshot_id: Option<String>,
     prepared: bool,
 }
@@ -71,23 +71,26 @@ impl Provider {
             required_context: vec!["candidate_identity".to_owned(), "route_context".to_owned()],
             configuration_schema: Some(serde_json::json!({
                 "type": "object",
-                "properties": {
-                    "artifact_path": {"type": "string", "minLength": 1}
-                },
-                "required": ["artifact_path"],
                 "additionalProperties": false
             })),
         }
     }
 
-    fn prepare(&mut self, options: &Value) -> Result<(Option<String>, Diagnostics), String> {
-        let artifact_path = options
-            .get("artifact_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.is_empty())
-            .ok_or_else(|| "options.artifact_path is required".to_owned())?;
-        let bytes = fs::read(artifact_path)
+    fn prepare(
+        &mut self,
+        artifacts: &[ArtifactDescriptor],
+        _resources: &[bliss_playlist_guidance_spi::ResourceDescriptor],
+    ) -> Result<(Option<String>, Diagnostics), String> {
+        let descriptor = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "resolved-lastfm-evidence-v1")
+            .ok_or_else(|| "resolved-lastfm-evidence-v1 artifact is required".to_owned())?;
+        let bytes = fs::read(&descriptor.path)
             .map_err(|error| format!("cannot read semantic artifact: {error}"))?;
+        let actual_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        if !actual_sha256.eq_ignore_ascii_case(&descriptor.sha256) {
+            return Err("semantic artifact sha256 mismatch".to_owned());
+        }
         let artifact: SemanticArtifact = serde_json::from_slice(&bytes)
             .map_err(|error| format!("cannot decode semantic artifact: {error}"))?;
         if artifact.schema_version != 1 {
@@ -96,6 +99,11 @@ impl Provider {
 
         self.edges.clear();
         for edge in artifact.edges {
+            let channel = match edge.source.kind.as_str() {
+                "track" => "lastfm_track",
+                "artist" => "lastfm_artist",
+                _ => continue,
+            };
             let Some(candidate_id) = edge.resolved_candidate_id else {
                 // Unresolved provider identities are deliberately ignored. The
                 // optimizer must only receive guidance for local candidates.
@@ -106,11 +114,14 @@ impl Provider {
                 .map(|value| value.clamp(0.0, 1.0))
                 .or_else(|| edge.raw_rank.map(|rank| 1.0 / f64::from(rank)))
                 .unwrap_or(0.0);
-            let entry = self
+            let by_channel = self
                 .edges
                 .entry(edge.source.id.clone())
                 .or_default()
                 .entry(candidate_id)
+                .or_default();
+            let entry = by_channel
+                .entry(channel.to_owned())
                 .or_insert_with(|| EdgeScore {
                     score: 0.0,
                     confidence: 0.0,
@@ -127,7 +138,7 @@ impl Provider {
             }
         }
 
-        let snapshot_id = format!("{}:sources:{}", artifact_path, self.edges.len());
+        let snapshot_id = format!("{}:sources:{}", actual_sha256, self.edges.len());
         self.snapshot_id = Some(snapshot_id.clone());
         self.prepared = true;
         Ok((
@@ -138,7 +149,9 @@ impl Provider {
                 failure_count: 0,
                 details: Some(serde_json::json!({
                     "source_entities": self.edges.len(),
-                    "resolved_candidate_edges": self.edges.values().map(HashMap::len).sum::<usize>(),
+                    "resolved_candidate_edges": self.edges.values()
+                        .map(|by_candidate| by_candidate.values().map(BTreeMap::len).sum::<usize>())
+                        .sum::<usize>(),
                 })),
             },
         ))
@@ -165,36 +178,42 @@ impl Provider {
         .into_iter()
         .flatten()
         .collect();
-        let signals: Vec<GuidanceSignal> = candidates
-            .iter()
-            .filter_map(|candidate| {
-                let mut best: Option<(f64, f64, String, Option<String>)> = None;
-                for source_id in &source_ids {
-                    let Some(score) = self
-                        .edges
-                        .get(*source_id)
-                        .and_then(|by_candidate| by_candidate.get(&candidate.candidate_id))
-                    else {
-                        continue;
-                    };
+        let mut signals = Vec::new();
+        for candidate in candidates {
+            let mut best_by_channel: BTreeMap<String, (f64, f64, String, Option<String>)> =
+                BTreeMap::new();
+            for source_id in &source_ids {
+                let Some(by_channel) = self
+                    .edges
+                    .get(*source_id)
+                    .and_then(|by_candidate| by_candidate.get(&candidate.candidate_id))
+                else {
+                    continue;
+                };
+                for (channel, score) in by_channel {
                     let weighted = score.score * score.confidence;
-                    if best
-                        .as_ref()
+                    let replace = best_by_channel
+                        .get(channel)
                         .map(|entry| weighted > entry.0)
-                        .unwrap_or(true)
-                    {
-                        best = Some((
-                            weighted,
-                            score.confidence,
-                            score.kind.clone(),
-                            score.observed_at.clone(),
-                        ));
+                        .unwrap_or(true);
+                    if replace {
+                        best_by_channel.insert(
+                            channel.clone(),
+                            (
+                                weighted,
+                                score.confidence,
+                                score.kind.clone(),
+                                score.observed_at.clone(),
+                            ),
+                        );
                     }
                 }
-                let (score, confidence, kind, observed_at) = best?;
-                Some(
+            }
+            for (channel, (score, confidence, kind, observed_at)) in best_by_channel {
+                signals.push(
                     GuidanceSignal {
                         candidate_id: candidate.candidate_id.clone(),
+                        channel,
                         scope: GuidanceScope::Edge,
                         score: score.clamp(0.0, 1.0),
                         confidence: confidence.clamp(0.0, 1.0),
@@ -202,9 +221,9 @@ impl Provider {
                         observed_at,
                     }
                     .bounded(),
-                )
-            })
-            .collect();
+                );
+            }
+        }
         let matched = signals.len();
         GuidanceResponse::Scores {
             provider_id: PROVIDER_ID.to_owned(),
@@ -235,7 +254,8 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
         }
         GuidanceRequest::Prepare {
             spi_version,
-            options,
+            artifacts,
+            resources,
             ..
         } => {
             if spi_version != SPI_VERSION {
@@ -246,7 +266,7 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
                     retryable: false,
                 };
             }
-            match provider.prepare(&options) {
+            match provider.prepare(&artifacts, &resources) {
                 Ok((snapshot_id, diagnostics)) => GuidanceResponse::Prepared {
                     provider_id: PROVIDER_ID.to_owned(),
                     snapshot_id,
@@ -330,14 +350,29 @@ fn break_with_error(stdout: &mut impl Write, code: &str, message: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bliss_playlist_guidance_spi::ArtifactDescriptor;
+    use sha2::{Digest, Sha256};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static FIXTURE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
     fn fixture_path() -> PathBuf {
         std::env::temp_dir().join(format!(
-            "bliss-guidance-lastfm-{}-{}.json",
+            "bliss-guidance-lastfm-{}-{}-{}.json",
             std::process::id(),
-            PROVIDER_VERSION.replace('.', "-")
+            PROVIDER_VERSION.replace('.', "-"),
+            FIXTURE_SERIAL.fetch_add(1, Ordering::Relaxed),
         ))
+    }
+
+    fn artifact_descriptor(path: &std::path::Path) -> ArtifactDescriptor {
+        let bytes = fs::read(path).unwrap();
+        ArtifactDescriptor {
+            kind: "resolved-lastfm-evidence-v1".to_owned(),
+            path: path.to_string_lossy().into_owned(),
+            sha256: format!("{:x}", Sha256::digest(bytes)),
+        }
     }
 
     #[test]
@@ -373,8 +408,8 @@ mod tests {
         fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
 
         let mut provider = Provider::default();
-        let options = serde_json::json!({"artifact_path": path});
-        provider.prepare(&options).unwrap();
+        let descriptor = artifact_descriptor(&path);
+        provider.prepare(&[descriptor], &[]).unwrap();
         let context = bliss_playlist_guidance_spi::ScoreContext {
             scope: GuidanceScope::Edge,
             left_anchor_id: Some("missing-source".to_owned()),
@@ -383,6 +418,7 @@ mod tests {
         };
         let candidates = vec![Candidate {
             candidate_id: "candidate-1".to_owned(),
+            lms_urlmd5: None,
             database_file: None,
             title: None,
             artist: None,
@@ -399,6 +435,75 @@ mod tests {
             }
             other => panic!("expected scores response, got {other:?}"),
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn prepare_rejects_a_lastfm_artifact_with_an_invalid_hash() {
+        let path = fixture_path();
+        fs::write(&path, br#"{"schema_version":1,"edges":[]}"#).unwrap();
+        let mut descriptor = artifact_descriptor(&path);
+        descriptor.sha256 = "0".repeat(64);
+
+        let mut provider = Provider::default();
+        let error = provider.prepare(&[descriptor], &[]).unwrap_err();
+
+        assert!(error.contains("sha256"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn score_preserves_independent_track_and_artist_channels() {
+        let path = fixture_path();
+        let artifact = serde_json::json!({
+            "schema_version": 1,
+            "edges": [
+                {
+                    "source": {"kind": "track", "id": "source-a"},
+                    "resolved_candidate_id": "candidate-1",
+                    "raw_score": 0.9,
+                    "identity_confidence": 0.8
+                },
+                {
+                    "source": {"kind": "artist", "id": "source-a"},
+                    "resolved_candidate_id": "candidate-1",
+                    "raw_score": 0.7,
+                    "identity_confidence": 0.9
+                }
+            ]
+        });
+        fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+
+        let mut provider = Provider::default();
+        provider
+            .prepare(&[artifact_descriptor(&path)], &[])
+            .unwrap();
+        let response = provider.score(
+            "request-1",
+            &bliss_playlist_guidance_spi::ScoreContext {
+                scope: GuidanceScope::Edge,
+                left_anchor_id: Some("source-a".to_owned()),
+                right_anchor_id: None,
+                context_track_ids: vec![],
+            },
+            &[Candidate {
+                candidate_id: "candidate-1".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: None,
+                artist: None,
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            }],
+        );
+
+        let GuidanceResponse::Scores { signals, .. } = response else {
+            panic!("expected scores response");
+        };
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].channel, "lastfm_artist");
+        assert_eq!(signals[1].channel, "lastfm_track");
         let _ = fs::remove_file(path);
     }
 }
