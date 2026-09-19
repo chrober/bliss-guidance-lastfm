@@ -68,7 +68,10 @@ impl Provider {
             provider_id: PROVIDER_ID.to_owned(),
             provider_version: PROVIDER_VERSION.to_owned(),
             protocol: PROTOCOL_NAME.to_owned(),
-            capabilities: vec![Capability::EdgeCandidateGuidance],
+            capabilities: vec![
+                Capability::GlobalCandidateGuidance,
+                Capability::EdgeCandidateGuidance,
+            ],
             channels: vec![
                 ChannelDescriptor {
                     channel: "lastfm_track".to_owned(),
@@ -401,7 +404,10 @@ mod tests {
         assert_eq!(manifest.protocol, PROTOCOL_NAME);
         assert_eq!(
             manifest.capabilities,
-            vec![Capability::EdgeCandidateGuidance]
+            vec![
+                Capability::GlobalCandidateGuidance,
+                Capability::EdgeCandidateGuidance,
+            ]
         );
         assert_eq!(
             manifest
