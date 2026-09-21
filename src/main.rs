@@ -125,7 +125,10 @@ impl Provider {
         self.edges.clear();
         for edge in artifact.edges {
             let channel = match edge.source.kind.as_str() {
-                "track" => "lastfm_track",
+                // Better Call Bliss serializes Last.fm track observations as
+                // recording entities, matching the shared semantic-evidence
+                // vocabulary. Retain `track` for older valid artifacts.
+                "recording" | "track" => "lastfm_track",
                 "artist" => "lastfm_artist",
                 _ => continue,
             };
@@ -503,6 +506,53 @@ mod tests {
             }
             other => panic!("expected scores response, got {other:?}"),
         }
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn score_uses_resolved_recording_edges_written_by_better_call_bliss() {
+        let path = fixture_path();
+        let artifact = serde_json::json!({
+            "schema_version": 1,
+            "edges": [{
+                "source": {"kind": "recording", "id": "lms-track-42"},
+                "resolved_candidate_id": "bliss-row-7",
+                "raw_score": 0.9,
+                "identity_confidence": 1.0
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+
+        let mut provider = Provider::default();
+        provider
+            .prepare(&[artifact_descriptor(&path)], &[])
+            .unwrap();
+        let response = provider.score(
+            "recording-edge",
+            &bliss_playlist_guidance_spi::ScoreContext {
+                scope: GuidanceScope::Global,
+                left_anchor_id: None,
+                right_anchor_id: None,
+                context_track_ids: vec!["lms-track-42".to_owned()],
+            },
+            &[Candidate {
+                candidate_id: "bliss-row-7".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: None,
+                artist: None,
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            }],
+        );
+
+        let GuidanceResponse::Scores { signals, .. } = response else {
+            panic!("expected scores response");
+        };
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].candidate_id, "bliss-row-7");
+        assert_eq!(signals[0].channel, "lastfm_track");
         let _ = fs::remove_file(path);
     }
 
