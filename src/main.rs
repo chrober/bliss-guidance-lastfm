@@ -7,7 +7,7 @@ use bliss_playlist_guidance_spi::{
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, BufRead, Write};
 
@@ -35,6 +35,10 @@ struct SemanticArtifact {
 struct SemanticEntity {
     kind: String,
     id: String,
+    #[serde(default)]
+    mbid: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,6 +64,10 @@ fn default_confidence() -> f64 {
 struct Provider {
     // Source entity id -> candidate id -> channel -> strongest relation.
     edges: HashMap<String, HashMap<String, BTreeMap<String, EdgeScore>>>,
+    // LMS source-track ID -> artist source IDs used by Last.fm artist edges.
+    // This bridge is derived from the host-provided SPI anchors at prepare
+    // time, preferably via MusicBrainz artist IDs.
+    artist_sources_by_track: HashMap<String, Vec<String>>,
     snapshot_id: Option<String>,
     prepared: bool,
 }
@@ -101,10 +109,11 @@ impl Provider {
         }
     }
 
-    fn prepare(
+    fn prepare_with_anchors(
         &mut self,
         artifacts: &[ArtifactDescriptor],
         _resources: &[bliss_playlist_guidance_spi::ResourceDescriptor],
+        anchors: &[bliss_playlist_guidance_spi::Anchor],
     ) -> Result<(Option<String>, Diagnostics), String> {
         let descriptor = artifacts
             .iter()
@@ -123,6 +132,51 @@ impl Provider {
         }
 
         self.edges.clear();
+        self.artist_sources_by_track.clear();
+        let mut artist_sources_by_mbid = HashMap::<String, BTreeSet<String>>::new();
+        let mut artist_sources_by_name = HashMap::<String, BTreeSet<String>>::new();
+        for edge in &artifact.edges {
+            if edge.source.kind != "artist" {
+                continue;
+            }
+            if let Some(mbid) = edge.source.mbid.as_deref() {
+                artist_sources_by_mbid
+                    .entry(mbid.to_ascii_lowercase())
+                    .or_default()
+                    .insert(edge.source.id.clone());
+            }
+            if let Some(name) = edge.source.name.as_deref() {
+                artist_sources_by_name
+                    .entry(normalize_artist_name(name))
+                    .or_default()
+                    .insert(edge.source.id.clone());
+            }
+        }
+        for anchor in anchors {
+            let mut artist_sources = BTreeSet::new();
+            for mbid in &anchor.track.artist_mbids {
+                if let Some(source_ids) = artist_sources_by_mbid.get(&mbid.to_ascii_lowercase()) {
+                    artist_sources.extend(source_ids.iter().cloned());
+                }
+            }
+            // MBIDs are the authoritative join. Name matching keeps artist
+            // guidance useful for a source whose metadata has no artist MBID.
+            if artist_sources.is_empty() {
+                if let Some(name) = anchor.track.artist.as_deref() {
+                    if let Some(source_ids) =
+                        artist_sources_by_name.get(&normalize_artist_name(name))
+                    {
+                        artist_sources.extend(source_ids.iter().cloned());
+                    }
+                }
+            }
+            if !artist_sources.is_empty() {
+                self.artist_sources_by_track.insert(
+                    anchor.anchor_id.clone(),
+                    artist_sources.into_iter().collect(),
+                );
+            }
+        }
         for edge in artifact.edges {
             let channel = match edge.source.kind.as_str() {
                 // Better Call Bliss serializes Last.fm track observations as
@@ -177,6 +231,7 @@ impl Provider {
                 failure_count: 0,
                 details: Some(serde_json::json!({
                     "source_entities": self.edges.len(),
+                    "track_artist_mappings": self.artist_sources_by_track.len(),
                     "resolved_candidate_edges": self.edges.values()
                         .map(|by_candidate| by_candidate.values().map(BTreeMap::len).sum::<usize>())
                         .sum::<usize>(),
@@ -199,19 +254,23 @@ impl Provider {
                 retryable: false,
             };
         }
-        let mut source_ids = context
-            .context_track_ids
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
+        let mut source_ids = context.context_track_ids.clone();
         source_ids.extend(
             [
                 context.left_anchor_id.as_deref(),
                 context.right_anchor_id.as_deref(),
             ]
             .into_iter()
-            .flatten(),
+            .flatten()
+            .map(str::to_owned),
         );
+        let artist_source_ids = source_ids
+            .iter()
+            .filter_map(|track_id| self.artist_sources_by_track.get(track_id))
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        source_ids.extend(artist_source_ids);
         source_ids.sort_unstable();
         source_ids.dedup();
         let mut signals = Vec::new();
@@ -221,7 +280,7 @@ impl Provider {
             for source_id in &source_ids {
                 let Some(by_channel) = self
                     .edges
-                    .get(*source_id)
+                    .get(source_id)
                     .and_then(|by_candidate| by_candidate.get(&candidate.candidate_id))
                 else {
                     continue;
@@ -275,6 +334,10 @@ impl Provider {
     }
 }
 
+fn normalize_artist_name(name: &str) -> String {
+    name.trim().to_lowercase()
+}
+
 fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse {
     match request {
         GuidanceRequest::Describe { spi_version } => {
@@ -292,6 +355,7 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
             spi_version,
             artifacts,
             resources,
+            anchors,
             ..
         } => {
             if spi_version != SPI_VERSION {
@@ -302,7 +366,7 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
                     retryable: false,
                 };
             }
-            match provider.prepare(&artifacts, &resources) {
+            match provider.prepare_with_anchors(&artifacts, &resources, &anchors) {
                 Ok((snapshot_id, diagnostics)) => GuidanceResponse::Prepared {
                     provider_id: PROVIDER_ID.to_owned(),
                     snapshot_id,
@@ -480,7 +544,9 @@ mod tests {
 
         let mut provider = Provider::default();
         let descriptor = artifact_descriptor(&path);
-        provider.prepare(&[descriptor], &[]).unwrap();
+        provider
+            .prepare_with_anchors(&[descriptor], &[], &[])
+            .unwrap();
         let context = bliss_playlist_guidance_spi::ScoreContext {
             scope: GuidanceScope::Edge,
             left_anchor_id: Some("missing-source".to_owned()),
@@ -525,7 +591,7 @@ mod tests {
 
         let mut provider = Provider::default();
         provider
-            .prepare(&[artifact_descriptor(&path)], &[])
+            .prepare_with_anchors(&[artifact_descriptor(&path)], &[], &[])
             .unwrap();
         let response = provider.score(
             "recording-edge",
@@ -572,7 +638,7 @@ mod tests {
 
         let mut provider = Provider::default();
         provider
-            .prepare(&[artifact_descriptor(&path)], &[])
+            .prepare_with_anchors(&[artifact_descriptor(&path)], &[], &[])
             .unwrap();
         let response = provider.score(
             "request-global",
@@ -604,6 +670,137 @@ mod tests {
     }
 
     #[test]
+    fn score_expands_a_track_context_to_its_anchor_artist_mbid() {
+        // Better Call Bliss asks global guidance with LMS track IDs, while its
+        // Last.fm artist.getSimilar observations are keyed by artist IDs. The
+        // provider must use the SPI prepare anchors to bridge those identities.
+        let path = fixture_path();
+        let artifact = serde_json::json!({
+            "schema_version": 1,
+            "edges": [{
+                "source": {
+                    "kind": "artist",
+                    "id": "artist:layla-zoe",
+                    "mbid": "artist-mbid-1",
+                    "name": "Layla Zoe"
+                },
+                "resolved_candidate_id": "bliss-row-51431",
+                "raw_score": 0.8,
+                "identity_confidence": 1.0
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+
+        let anchor = bliss_playlist_guidance_spi::Anchor {
+            anchor_id: "lms-track-2623395".to_owned(),
+            track: Candidate {
+                candidate_id: "lms-track-2623395".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: None,
+                artist: Some("Layla Zoe".to_owned()),
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec!["artist-mbid-1".to_owned()],
+            },
+        };
+        let mut provider = Provider::default();
+        provider
+            .prepare_with_anchors(&[artifact_descriptor(&path)], &[], &[anchor])
+            .unwrap();
+
+        let response = provider.score(
+            "artist-via-track-context",
+            &bliss_playlist_guidance_spi::ScoreContext {
+                scope: GuidanceScope::Global,
+                left_anchor_id: None,
+                right_anchor_id: None,
+                context_track_ids: vec!["lms-track-2623395".to_owned()],
+            },
+            &[Candidate {
+                candidate_id: "bliss-row-51431".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: None,
+                artist: None,
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            }],
+        );
+
+        let GuidanceResponse::Scores { signals, .. } = response else {
+            panic!("expected scores response");
+        };
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].channel, "lastfm_artist");
+        assert_eq!(signals[0].candidate_id, "bliss-row-51431");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn score_expands_an_edge_anchor_to_its_artist_relation() {
+        let path = fixture_path();
+        let artifact = serde_json::json!({
+            "schema_version": 1,
+            "edges": [{
+                "source": {
+                    "kind": "artist",
+                    "id": "artist:layla-zoe",
+                    "mbid": "artist-mbid-1"
+                },
+                "resolved_candidate_id": "bliss-row-51431",
+                "raw_score": 0.8
+            }]
+        });
+        fs::write(&path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+        let anchor = bliss_playlist_guidance_spi::Anchor {
+            anchor_id: "lms-track-2623395".to_owned(),
+            track: Candidate {
+                candidate_id: "lms-track-2623395".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: None,
+                artist: Some("Layla Zoe".to_owned()),
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec!["artist-mbid-1".to_owned()],
+            },
+        };
+        let mut provider = Provider::default();
+        provider
+            .prepare_with_anchors(&[artifact_descriptor(&path)], &[], &[anchor])
+            .unwrap();
+
+        let response = provider.score(
+            "artist-via-edge-anchor",
+            &bliss_playlist_guidance_spi::ScoreContext {
+                scope: GuidanceScope::Edge,
+                left_anchor_id: Some("lms-track-2623395".to_owned()),
+                right_anchor_id: None,
+                context_track_ids: vec![],
+            },
+            &[Candidate {
+                candidate_id: "bliss-row-51431".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: None,
+                artist: None,
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            }],
+        );
+
+        let GuidanceResponse::Scores { signals, .. } = response else {
+            panic!("expected scores response");
+        };
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].channel, "lastfm_artist");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn prepare_rejects_a_lastfm_artifact_with_an_invalid_hash() {
         let path = fixture_path();
         fs::write(&path, br#"{"schema_version":1,"edges":[]}"#).unwrap();
@@ -611,7 +808,9 @@ mod tests {
         descriptor.sha256 = "0".repeat(64);
 
         let mut provider = Provider::default();
-        let error = provider.prepare(&[descriptor], &[]).unwrap_err();
+        let error = provider
+            .prepare_with_anchors(&[descriptor], &[], &[])
+            .unwrap_err();
 
         assert!(error.contains("sha256"));
         let _ = fs::remove_file(path);
@@ -641,7 +840,7 @@ mod tests {
 
         let mut provider = Provider::default();
         provider
-            .prepare(&[artifact_descriptor(&path)], &[])
+            .prepare_with_anchors(&[artifact_descriptor(&path)], &[], &[])
             .unwrap();
         let response = provider.score(
             "request-1",
