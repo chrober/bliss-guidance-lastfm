@@ -108,6 +108,10 @@ SPI v2 prepare input:
 }
 ```
 
+`version --json` exposes declared host-policy support: `lastfm_track` supports
+bounded influence, while `lastfm_artist` supports bounded influence and target
+share. A host can use this metadata to avoid offering an unsupported choice.
+
 The addon communicates through versioned JSONL on stdin/stdout. It contributes
 bounded guidance only; Bliss acoustic quality and all hard route constraints
 remain optimizer responsibilities.
