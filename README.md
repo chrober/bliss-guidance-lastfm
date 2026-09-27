@@ -83,6 +83,13 @@ local candidate.
 The optimizer owns channel weights and applies these advisory signals only after
 Bliss has admitted candidates acoustically and all hard constraints have passed.
 
+`lastfm_track` declares support for the host's `bounded_influence` policy.
+`lastfm_artist` declares both `bounded_influence` and `target_share` support.
+Those declarations do not alter the raw observations emitted by this provider:
+the host chooses and applies the policy after it receives the same normalized
+track or artist support. In particular, the provider never calculates a target
+share multiplier or ranks candidates itself.
+
 This deliberately separates provider acquisition from optimizer scoring. A
 future transport implementation could fetch anonymous Last.fm data directly, but
 it would need to preserve the same frozen-evidence and failure-tolerant

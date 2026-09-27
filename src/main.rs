@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use bliss_playlist_guidance_spi::policy::HostPolicyKind;
 use bliss_playlist_guidance_spi::{
     encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
     GuidanceRequest, GuidanceResponse, GuidanceScope, GuidanceSignal, Manifest, PROTOCOL_NAME,
@@ -95,10 +96,15 @@ impl Provider {
                 ChannelDescriptor {
                     channel: "lastfm_track".to_owned(),
                     scopes: vec![GuidanceScope::Edge, GuidanceScope::Global],
+                    supported_host_policies: vec![HostPolicyKind::BoundedInfluence],
                 },
                 ChannelDescriptor {
                     channel: "lastfm_artist".to_owned(),
                     scopes: vec![GuidanceScope::Edge, GuidanceScope::Global],
+                    supported_host_policies: vec![
+                        HostPolicyKind::BoundedInfluence,
+                        HostPolicyKind::TargetShare,
+                    ],
                 },
             ],
             required_context: vec!["candidate_identity".to_owned(), "route_context".to_owned()],
@@ -518,6 +524,33 @@ mod tests {
                 .map(|channel| channel.channel.as_str())
                 .collect::<Vec<_>>(),
             vec!["lastfm_track", "lastfm_artist"]
+        );
+    }
+
+    #[test]
+    fn manifest_declares_artist_policy_capability_without_making_policy_provider_state() {
+        let manifest = Provider::manifest();
+        let track = manifest
+            .channels
+            .iter()
+            .find(|channel| channel.channel == "lastfm_track")
+            .unwrap();
+        let artist = manifest
+            .channels
+            .iter()
+            .find(|channel| channel.channel == "lastfm_artist")
+            .unwrap();
+
+        assert_eq!(
+            track.supported_host_policies,
+            vec![HostPolicyKind::BoundedInfluence]
+        );
+        assert_eq!(
+            artist.supported_host_policies,
+            vec![
+                HostPolicyKind::BoundedInfluence,
+                HostPolicyKind::TargetShare
+            ]
         );
     }
 
