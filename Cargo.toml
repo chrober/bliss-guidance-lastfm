@@ -12,3 +12,4 @@ bliss-playlist-guidance-spi = { git = "https://github.com/chrober/bliss-playlist
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+ureq = "2.12"

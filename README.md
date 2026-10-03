@@ -2,11 +2,13 @@
 
 `bliss-guidance-lastfm` is a provider addon for a Bliss-first host using the
 [`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi).
-The current host is `bliss-playlist-optimizer`. It consumes the existing
-`semantic-evidence-v1` raw artifact
-produced by Better Call Bliss and returns resolved, local-candidate Last.fm
-guidance for the current global or edge route context; unresolved provider
-identities are ignored.
+Current hosts use two acquisition modes. **Artifact mode** consumes a frozen,
+resolved `semantic-evidence-v1` artifact prepared by trusted host code (for
+example through LastMix). **Direct mode** obtains relations once during
+`prepare`, using an API key inherited only through the process environment,
+then freezes them in a versioned local TTL cache. Both modes return the same
+bounded `lastfm_track` and `lastfm_artist` guidance; `score` never performs
+network I/O.
 
 The host-neutral wire contract is maintained by
 [bliss-playlist-guidance-spi](https://github.com/chrober/bliss-playlist-guidance-spi).
@@ -90,10 +92,11 @@ the host chooses and applies the policy after it receives the same normalized
 track or artist support. In particular, the provider never calculates a target
 share multiplier or ranks candidates itself.
 
-This deliberately separates provider acquisition from optimizer scoring. A
-future transport implementation could fetch anonymous Last.fm data directly, but
-it would need to preserve the same frozen-evidence and failure-tolerant
-contract.
+Direct mode accepts only trusted launch configuration: `acquisition_mode`,
+cache path/TTL, deadline, bounded request concurrency, and (where a test or a
+trusted host needs it) the Last.fm endpoint. Its API key is read solely from
+`BLISS_GUIDANCE_LASTFM_API_KEY`; it is never included in options, requests,
+artifacts, cache entries, diagnostics, or errors.
 
 SPI v2 prepare input:
 
