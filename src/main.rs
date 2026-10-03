@@ -540,6 +540,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     static FIXTURE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -560,6 +561,11 @@ mod tests {
             PROVIDER_VERSION.replace('.', "-"),
             FIXTURE_SERIAL.fetch_add(1, Ordering::Relaxed),
         ))
+    }
+
+    fn api_key_environment_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
     fn artifact_descriptor(path: &std::path::Path) -> ArtifactDescriptor {
@@ -985,6 +991,7 @@ mod tests {
 
     #[test]
     fn direct_prepare_options_keep_api_key_outside_json_and_require_process_environment() {
+        let _api_key_environment = api_key_environment_lock();
         let options = serde_json::json!({
             "acquisition_mode": "direct",
             "cache_path": "/trusted/cache/lastfm-v1.json",
@@ -1067,6 +1074,7 @@ mod tests {
 
     #[test]
     fn direct_prepare_freezes_lastfm_relations_and_score_makes_no_network_request() {
+        let _api_key_environment = api_key_environment_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -1143,6 +1151,7 @@ mod tests {
 
     #[test]
     fn direct_prepare_uses_the_configured_bounded_request_concurrency() {
+        let _api_key_environment = api_key_environment_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1220,6 +1229,7 @@ mod tests {
 
     #[test]
     fn direct_prepare_retries_a_transient_lastfm_rate_limit() {
+        let _api_key_environment = api_key_environment_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::thread;
@@ -1287,6 +1297,7 @@ mod tests {
 
     #[test]
     fn direct_prepare_degrades_to_neutral_guidance_when_lastfm_is_unavailable() {
+        let _api_key_environment = api_key_environment_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
@@ -1321,6 +1332,7 @@ mod tests {
 
     #[test]
     fn direct_prepare_never_serializes_the_process_only_api_key() {
+        let _api_key_environment = api_key_environment_lock();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
