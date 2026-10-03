@@ -13,9 +13,9 @@ network I/O.
 The host-neutral wire contract is maintained by
 [bliss-playlist-guidance-spi](https://github.com/chrober/bliss-playlist-guidance-spi).
 
-Its SPI provider ID is `lastfm-guidance`. It does not contact Last.fm itself;
-Better Call Bliss/LastMix remains responsible for obtaining and caching the raw
-artifact.
+Its SPI provider ID is `lastfm-guidance`. In artifact mode, Better Call Bliss
+and LastMix remain responsible for obtaining and resolving evidence. In direct
+mode, this binary contacts Last.fm only during `prepare`.
 
 ## Data and information flow
 
@@ -41,11 +41,11 @@ resolves those observations against the frozen local candidate inventory and
 writes only resolved local candidate identities into `semantic-evidence-v1`.
 
 This add-on consumes no BlissMixer, BlissMixerLab, LastMix, or Better Call
-Bliss setting directly. Better Call Bliss passes the artifact in an SPI v2
-`prepare` descriptor with its expected SHA-256; the provider verifies the hash
-before decoding it. That separation keeps acquisition, settings interpretation,
-identity matching, and network failures outside the native route-search
-process.
+Bliss setting directly. In artifact mode, Better Call Bliss passes a prepared
+artifact in an SPI v2 `prepare` descriptor with its expected SHA-256; the
+provider verifies the hash before decoding it. In direct mode, the trusted host
+passes non-secret connection limits and supplies the API key through the child
+process environment only.
 
 During `prepare`, the add-on reads the artifact once and builds an index of
 `source entity -> local candidate ID -> channel -> strongest support`. It also
@@ -96,7 +96,13 @@ Direct mode accepts only trusted launch configuration: `acquisition_mode`,
 cache path/TTL, deadline, bounded request concurrency, and (where a test or a
 trusted host needs it) the Last.fm endpoint. Its API key is read solely from
 `BLISS_GUIDANCE_LASTFM_API_KEY`; it is never included in options, requests,
-artifacts, cache entries, diagnostics, or errors.
+artifacts, cache entries, diagnostics, or errors. Cache misses are fetched by a
+bounded worker pool (at most `max_concurrent_requests`), and transient `429`,
+`5xx`, and transport failures receive two short deadline-bounded retries.
+Successful empty relations are cached like any other result. When requests
+remain unavailable, `prepare` succeeds in a redacted `degraded` state with
+neutral guidance for those sources, so the host can continue with Bliss-only
+selection.
 
 SPI v2 prepare input:
 

@@ -2,6 +2,36 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LastFmError {
+    message: &'static str,
+    retryable: bool,
+}
+
+impl LastFmError {
+    pub(crate) fn retryable(message: &'static str) -> Self {
+        Self {
+            message,
+            retryable: true,
+        }
+    }
+
+    pub(crate) fn permanent(message: &'static str) -> Self {
+        Self {
+            message,
+            retryable: false,
+        }
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
+    }
+
+    pub fn message(&self) -> &'static str {
+        self.message
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SimilarTrack {
     pub artist: String,
@@ -46,7 +76,7 @@ impl LastFmClient {
         artist: &str,
         title: &str,
         recording_mbid: Option<&str>,
-    ) -> Result<Vec<SimilarTrack>, String> {
+    ) -> Result<Vec<SimilarTrack>, LastFmError> {
         let mut request = self
             .base_request("track.getSimilar")
             .query("artist", artist)
@@ -56,13 +86,14 @@ impl LastFmClient {
             request = request.query("mbid", mbid);
         }
         parse_similar_tracks(&self.call(request)?)
+            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))
     }
 
     pub fn similar_artists(
         &self,
         artist: &str,
         artist_mbid: Option<&str>,
-    ) -> Result<Vec<SimilarArtist>, String> {
+    ) -> Result<Vec<SimilarArtist>, LastFmError> {
         let mut request = self
             .base_request("artist.getSimilar")
             .query("artist", artist)
@@ -72,6 +103,7 @@ impl LastFmClient {
             request = request.query("mbid", mbid);
         }
         parse_similar_artists(&self.call(request)?)
+            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))
     }
 
     fn base_request(&self, method: &str) -> ureq::Request {
@@ -82,12 +114,25 @@ impl LastFmClient {
             .query("format", "json")
     }
 
-    fn call(&self, request: ureq::Request) -> Result<Value, String> {
-        let response = request
-            .call()
-            .map_err(|_| "direct Last.fm request failed".to_owned())?;
+    fn call(&self, request: ureq::Request) -> Result<Value, LastFmError> {
+        let response = match request.call() {
+            Ok(response) => response,
+            Err(ureq::Error::Status(status, _)) if status == 429 || status >= 500 => {
+                return Err(LastFmError::retryable(
+                    "direct Last.fm request is temporarily unavailable",
+                ));
+            }
+            Err(ureq::Error::Status(_, _)) => {
+                return Err(LastFmError::permanent(
+                    "direct Last.fm request was rejected",
+                ));
+            }
+            Err(ureq::Error::Transport(_)) => {
+                return Err(LastFmError::retryable("direct Last.fm request failed"));
+            }
+        };
         serde_json::from_reader(response.into_reader())
-            .map_err(|_| "direct Last.fm response is invalid".to_owned())
+            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))
     }
 }
 
