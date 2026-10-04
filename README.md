@@ -15,6 +15,11 @@ Its SPI provider ID is `lastfm-guidance`. It does not contact Last.fm itself;
 Better Call Bliss/LastMix remains responsible for obtaining and caching the raw
 artifact.
 
+This artifact-only boundary is the current released behavior (native provider
+0.1.2). The separate Lyrion provider exposes an **API Key** configuration
+option, but direct HTTP/cache acquisition is not implemented end to end yet;
+API-key mode therefore remains neutral until that work is released.
+
 ## Data and information flow
 
 ```mermaid
@@ -83,6 +88,13 @@ local candidate.
 The optimizer owns channel weights and applies these advisory signals only after
 Bliss has admitted candidates acoustically and all hard constraints have passed.
 
+`lastfm_track` declares support for the host's `bounded_influence` policy.
+`lastfm_artist` declares both `bounded_influence` and `target_share` support.
+Those declarations do not alter the raw observations emitted by this provider:
+the host chooses and applies the policy after it receives the same normalized
+track or artist support. In particular, the provider never calculates a target
+share multiplier or ranks candidates itself.
+
 This deliberately separates provider acquisition from optimizer scoring. A
 future transport implementation could fetch anonymous Last.fm data directly, but
 it would need to preserve the same frozen-evidence and failure-tolerant
@@ -100,6 +112,10 @@ SPI v2 prepare input:
   "resources": []
 }
 ```
+
+`version --json` exposes declared host-policy support: `lastfm_track` supports
+bounded influence, while `lastfm_artist` supports bounded influence and target
+share. A host can use this metadata to avoid offering an unsupported choice.
 
 The addon communicates through versioned JSONL on stdin/stdout. It contributes
 bounded guidance only; Bliss acoustic quality and all hard route constraints
