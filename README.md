@@ -15,10 +15,10 @@ Its SPI provider ID is `lastfm-guidance`. It does not contact Last.fm itself;
 Better Call Bliss/LastMix remains responsible for obtaining and caching the raw
 artifact.
 
-This artifact-only boundary is the current released behavior (native provider
-0.1.2). The separate Lyrion provider exposes an **API Key** configuration
-option, but direct HTTP/cache acquisition is not implemented end to end yet;
-API-key mode therefore remains neutral until that work is released.
+This artifact-only boundary is the current behavior. The separate Lyrion
+provider exposes an **API Key** configuration option, but direct HTTP/cache
+acquisition is not implemented end to end yet; API-key mode therefore remains
+neutral until that provider work is released.
 
 ## Data and information flow
 
