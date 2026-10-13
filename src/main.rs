@@ -1026,6 +1026,30 @@ mod tests {
     }
 
     #[test]
+    fn direct_cache_merges_entries_written_by_overlapping_provider_sessions() {
+        let path = fixture_path();
+        let mut first = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        let mut second = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        first.put("artist:first", serde_json::json!(["one"]), 100);
+        second.put("artist:second", serde_json::json!(["two"]), 101);
+
+        first.save().unwrap();
+        second.save().unwrap();
+
+        let merged = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        assert_eq!(
+            merged.get("artist:first", 101),
+            Some(serde_json::json!(["one"]))
+        );
+        assert_eq!(
+            merged.get("artist:second", 101),
+            Some(serde_json::json!(["two"]))
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("lock"));
+    }
+
+    #[test]
     fn direct_lastfm_parser_prefers_mbid_identities_without_retaining_api_configuration() {
         let payload = serde_json::json!({
             "similartracks": {"track": [{
@@ -1044,6 +1068,17 @@ mod tests {
     }
 
     #[test]
+    fn direct_lastfm_parser_negative_caches_unknown_tracks_and_artists() {
+        let not_found = serde_json::json!({"error": 6, "message": "not found"});
+        assert!(crate::lastfm_api::parse_similar_tracks(&not_found)
+            .unwrap()
+            .is_empty());
+        assert!(crate::lastfm_api::parse_similar_artists(&not_found)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
     fn direct_lastfm_client_queries_a_trusted_endpoint_without_exposing_the_api_key_in_errors() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -1058,6 +1093,7 @@ mod tests {
             let received = stream.read(&mut request).unwrap();
             let request = String::from_utf8_lossy(&request[..received]);
             assert!(request.contains("method=track.getSimilar"));
+            assert!(request.contains("limit=25"));
             let body = r#"{"similartracks":{"track":[{"name":"Related Song","mbid":"recording-mbid-2","match":0.9,"artist":{"name":"Related Artist","mbid":"artist-mbid-2"}}]}}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });

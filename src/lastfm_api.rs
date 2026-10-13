@@ -81,7 +81,8 @@ impl LastFmClient {
             .base_request("track.getSimilar")
             .query("artist", artist)
             .query("track", title)
-            .query("autocorrect", "1");
+            .query("autocorrect", "1")
+            .query("limit", "25");
         if let Some(mbid) = recording_mbid.filter(|value| !value.is_empty()) {
             request = request.query("mbid", mbid);
         }
@@ -137,6 +138,9 @@ impl LastFmClient {
 }
 
 pub fn parse_similar_tracks(payload: &Value) -> Result<Vec<SimilarTrack>, String> {
+    if is_not_found(payload) {
+        return Ok(Vec::new());
+    }
     let tracks = payload
         .get("similartracks")
         .and_then(|value| value.get("track"))
@@ -160,6 +164,9 @@ pub fn parse_similar_tracks(payload: &Value) -> Result<Vec<SimilarTrack>, String
 }
 
 pub fn parse_similar_artists(payload: &Value) -> Result<Vec<SimilarArtist>, String> {
+    if is_not_found(payload) {
+        return Ok(Vec::new());
+    }
     let artists = payload
         .get("similarartists")
         .and_then(|value| value.get("artist"))
@@ -190,4 +197,11 @@ fn optional_score(value: Option<&Value>) -> Option<f64> {
     value
         .and_then(|value| value.as_f64().or_else(|| value.as_str()?.parse().ok()))
         .map(|value| value.clamp(0.0, 1.0))
+}
+
+fn is_not_found(payload: &Value) -> bool {
+    payload
+        .get("error")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        == Some(6)
 }

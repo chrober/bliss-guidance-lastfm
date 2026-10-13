@@ -1,7 +1,9 @@
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 
 const CACHE_SCHEMA_VERSION: u8 = 1;
@@ -61,16 +63,46 @@ impl PersistentCache {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let bytes = serde_json::to_vec(&CacheFile {
-            schema_version: CACHE_SCHEMA_VERSION,
-            entries: self.entries.clone(),
-        })
-        .map_err(|error| format!("cannot encode Last.fm cache: {error}"))?;
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(|error| {
                 format!("cannot create trusted Last.fm cache directory: {error}")
             })?;
         }
+        let lock_path = self.path.with_extension("lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("cannot open trusted Last.fm cache lock: {error}"))?;
+        lock.lock_exclusive()
+            .map_err(|error| format!("cannot lock trusted Last.fm cache: {error}"))?;
+
+        let mut entries = match fs::read(&self.path) {
+            Ok(bytes) => match serde_json::from_slice::<CacheFile>(&bytes) {
+                Ok(file) if file.schema_version == CACHE_SCHEMA_VERSION => file.entries,
+                _ => BTreeMap::new(),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) => return Err(format!("cannot read trusted Last.fm cache: {error}")),
+        };
+        for (key, candidate) in &self.entries {
+            let replace = entries
+                .get(key)
+                .map(|existing| {
+                    candidate.fetched_at_unix_seconds >= existing.fetched_at_unix_seconds
+                })
+                .unwrap_or(true);
+            if replace {
+                entries.insert(key.clone(), candidate.clone());
+            }
+        }
+        let bytes = serde_json::to_vec(&CacheFile {
+            schema_version: CACHE_SCHEMA_VERSION,
+            entries,
+        })
+        .map_err(|error| format!("cannot encode Last.fm cache: {error}"))?;
         let temporary = self.path.with_extension("tmp");
         fs::write(&temporary, bytes)
             .map_err(|error| format!("cannot write trusted Last.fm cache: {error}"))?;
@@ -80,6 +112,8 @@ impl PersistentCache {
                 .map_err(|error| format!("cannot replace trusted Last.fm cache: {error}"))?;
         }
         fs::rename(&temporary, &self.path)
-            .map_err(|error| format!("cannot finalize trusted Last.fm cache: {error}"))
+            .map_err(|error| format!("cannot finalize trusted Last.fm cache: {error}"))?;
+        FileExt::unlock(&lock)
+            .map_err(|error| format!("cannot unlock trusted Last.fm cache: {error}"))
     }
 }
