@@ -76,6 +76,7 @@ struct Provider {
     direct: Option<direct::DirectPrepared>,
     snapshot_id: Option<String>,
     prepared: bool,
+    diagnostic_level: String,
 }
 
 #[derive(Clone)]
@@ -125,6 +126,7 @@ impl Provider {
                     "lastfm_track_influence": {"type": "integer", "minimum": 0, "maximum": 100},
                     "lastfm_artist_mode": {"enum": ["target_share", "bounded_influence"]},
                     "lastfm_artist_level": {"type": "integer", "minimum": 0, "maximum": 100}
+                    ,"diagnostic_level": {"enum": ["warning", "info", "debug"]}
                 },
                 "additionalProperties": false
             })),
@@ -258,6 +260,17 @@ impl Provider {
                     "resolved_candidate_edges": self.edges.values()
                         .map(|by_candidate| by_candidate.values().map(BTreeMap::len).sum::<usize>())
                         .sum::<usize>(),
+                    "log_events_v1": if wants_info(&self.diagnostic_level) {
+                        vec![provider_log_event(
+                            "info", "prepare", "lastfm_prepare_completed", None, None,
+                            Some(self.edges.values().map(|by_candidate| by_candidate.values().map(BTreeMap::len).sum::<usize>()).sum::<usize>()),
+                            Some(serde_json::json!({
+                                "source": "LastMix",
+                                "source_entities": self.edges.len(),
+                                "track_artist_mappings": self.artist_sources_by_track.len(),
+                            })),
+                        )]
+                    } else { Vec::new() },
                 })),
             },
         ))
@@ -271,6 +284,7 @@ impl Provider {
         self.edges.clear();
         self.artist_sources_by_track.clear();
         let options = direct::DirectOptions::from_prepare_options(options)?;
+        self.diagnostic_level = options.diagnostic_level.clone();
         let (prepared, diagnostics) = direct::DirectPrepared::prepare(&options, anchors)?;
         let snapshot_id = format!(
             "direct:sources:{}:requests:{}:cache_hits:{}",
@@ -380,6 +394,31 @@ impl Provider {
             }
         }
         let matched = signals.len();
+        let track_supported = signals
+            .iter()
+            .filter(|signal| signal.channel == "lastfm_track")
+            .count();
+        let artist_supported = signals
+            .iter()
+            .filter(|signal| signal.channel == "lastfm_artist")
+            .count();
+        let log_events = if self.diagnostic_level == "debug" {
+            vec![provider_log_event(
+                "debug",
+                "score",
+                "lastfm_scoring_completed",
+                None,
+                None,
+                Some(matched),
+                Some(serde_json::json!({
+                    "candidates": candidates.len(),
+                    "similar_track_supported": track_supported,
+                    "similar_artist_supported": artist_supported,
+                })),
+            )]
+        } else {
+            Vec::new()
+        };
         GuidanceResponse::Scores {
             provider_id: PROVIDER_ID.to_owned(),
             request_id: request_id.to_owned(),
@@ -388,10 +427,48 @@ impl Provider {
                 state: Some("fresh".to_owned()),
                 request_count: 1,
                 failure_count: 0,
-                details: Some(serde_json::json!({"matched_candidates": matched})),
+                details: Some(serde_json::json!({
+                    "matched_candidates": matched,
+                    "log_events_v1": log_events,
+                })),
             },
         }
     }
+}
+
+fn diagnostic_level(options: &serde_json::Value) -> &str {
+    options
+        .get("diagnostic_level")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "warning" | "info" | "debug"))
+        .unwrap_or("warning")
+}
+
+fn wants_info(level: &str) -> bool {
+    matches!(level, "info" | "debug")
+}
+
+fn provider_log_event(
+    level: &str,
+    phase: &str,
+    event: &str,
+    operation: Option<&str>,
+    source: Option<serde_json::Value>,
+    result_count: Option<usize>,
+    details: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event_version": "guidance_log_event_v1",
+        "level": level,
+        "phase": phase,
+        "event": event,
+        "provider_id": PROVIDER_ID,
+        "operation": operation,
+        "source": source,
+        "cache_state": null,
+        "result_count": result_count,
+        "details": details,
+    })
 }
 
 fn normalize_artist_name(name: &str) -> String {
@@ -427,6 +504,7 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
                     retryable: false,
                 };
             }
+            provider.diagnostic_level = diagnostic_level(&options).to_owned();
             let result = if options
                 .get("acquisition_mode")
                 .and_then(serde_json::Value::as_str)
@@ -1138,6 +1216,7 @@ mod tests {
             "acquisition_mode": "direct", "api_endpoint": endpoint,
             "cache_path": cache_path, "cache_ttl_seconds": 3600,
             "request_deadline_ms": 5000, "max_concurrent_requests": 2,
+            "diagnostic_level": "debug",
         });
         let anchors = vec![bliss_playlist_guidance_spi::Anchor {
             anchor_id: "lms-track-1".to_owned(),
@@ -1153,8 +1232,24 @@ mod tests {
             },
         }];
         let mut provider = Provider::default();
-        provider.prepare_direct(&options, &anchors).unwrap();
+        let (_, prepare_diagnostics) = provider.prepare_direct(&options, &anchors).unwrap();
         server.join().unwrap();
+
+        let prepare_events = prepare_diagnostics.details.as_ref().unwrap()["log_events_v1"]
+            .as_array()
+            .unwrap();
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "lastfm_lookup_requested"));
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "lastfm_lookup_completed"));
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "lastfm_response_json"));
+        assert!(!serde_json::to_string(prepare_events)
+            .unwrap()
+            .contains("test-api-key"));
 
         let response = provider.score(
             "direct-score",
@@ -1175,12 +1270,22 @@ mod tests {
                 artist_mbids: vec!["artist-mbid-2".to_owned()],
             }],
         );
-        let GuidanceResponse::Scores { signals, .. } = response else {
+        let GuidanceResponse::Scores {
+            signals,
+            diagnostics,
+            ..
+        } = response
+        else {
             panic!("expected scores");
         };
         assert_eq!(signals.len(), 2);
         assert_eq!(signals[0].channel, "lastfm_artist");
         assert_eq!(signals[1].channel, "lastfm_track");
+        assert!(diagnostics.details.as_ref().unwrap()["log_events_v1"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "lastfm_scoring_completed"));
         std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
         let _ = fs::remove_file(cache_path);
     }

@@ -11,6 +11,42 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const API_KEY_ENVIRONMENT: &str = "BLISS_GUIDANCE_LASTFM_API_KEY";
 const MAX_TRANSIENT_RETRIES: u8 = 2;
 const RETRY_BACKOFF_MILLIS: u64 = 100;
+const MAX_LOG_EVENTS: usize = 64;
+
+fn wants_info(level: &str) -> bool {
+    matches!(level, "info" | "debug")
+}
+
+fn wants_debug(level: &str) -> bool {
+    level == "debug"
+}
+
+fn push_log_event(
+    events: &mut Vec<Value>,
+    level: &str,
+    event: &str,
+    operation: Option<&str>,
+    source: Option<Value>,
+    cache_state: Option<&str>,
+    result_count: Option<usize>,
+    details: Option<Value>,
+) {
+    if events.len() >= MAX_LOG_EVENTS {
+        return;
+    }
+    events.push(serde_json::json!({
+        "event_version": "guidance_log_event_v1",
+        "level": level,
+        "phase": "prepare",
+        "event": event,
+        "provider_id": "lastfm-guidance",
+        "operation": operation,
+        "source": source,
+        "cache_state": cache_state,
+        "result_count": result_count,
+        "details": details,
+    }));
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectOptions {
@@ -19,6 +55,7 @@ pub struct DirectOptions {
     pub cache_ttl_seconds: u64,
     pub request_deadline_ms: u64,
     pub max_concurrent_requests: usize,
+    pub diagnostic_level: String,
 }
 
 impl DirectOptions {
@@ -46,12 +83,19 @@ impl DirectOptions {
         let cache_ttl_seconds = integer_option(object, "cache_ttl_seconds", 1, 2_592_000)?;
         let request_deadline_ms = integer_option(object, "request_deadline_ms", 100, 60_000)?;
         let max_concurrent_requests = integer_option(object, "max_concurrent_requests", 1, 8)?;
+        let diagnostic_level = object
+            .get("diagnostic_level")
+            .and_then(Value::as_str)
+            .filter(|value| matches!(*value, "warning" | "info" | "debug"))
+            .unwrap_or("warning")
+            .to_owned();
         Ok(Self {
             api_endpoint,
             cache_path: cache_path.to_owned(),
             cache_ttl_seconds,
             request_deadline_ms,
             max_concurrent_requests: max_concurrent_requests as usize,
+            diagnostic_level,
         })
     }
 
@@ -98,6 +142,61 @@ impl FetchTask {
     fn cache_key(&self) -> &str {
         match self {
             Self::Track { cache_key, .. } | Self::Artist { cache_key, .. } => cache_key,
+        }
+    }
+
+    fn operation(&self) -> &'static str {
+        match self {
+            Self::Track { .. } => "track.getSimilar",
+            Self::Artist { .. } => "artist.getSimilar",
+        }
+    }
+
+    fn source(&self) -> Value {
+        match self {
+            Self::Track {
+                artist,
+                title,
+                recording_mbid,
+                ..
+            } => serde_json::json!({
+                "label": format!("{artist} - {title}"),
+                "identity_kind": if recording_mbid.is_some() { "recording_mbid" } else { "track_name" },
+                "mbid": recording_mbid,
+                "artist": artist,
+                "title": title,
+            }),
+            Self::Artist {
+                artist,
+                artist_mbid,
+                ..
+            } => serde_json::json!({
+                "label": artist,
+                "identity_kind": if artist_mbid.is_some() { "artist_mbid" } else { "artist_name" },
+                "mbid": artist_mbid,
+            }),
+        }
+    }
+
+    fn sanitized_request(&self) -> Value {
+        match self {
+            Self::Track {
+                artist,
+                title,
+                recording_mbid,
+                ..
+            } => serde_json::json!({
+                "method": self.operation(), "artist": artist, "track": title,
+                "mbid": recording_mbid, "limit": 25,
+            }),
+            Self::Artist {
+                artist,
+                artist_mbid,
+                ..
+            } => serde_json::json!({
+                "method": self.operation(), "artist": artist,
+                "mbid": artist_mbid, "limit": 25,
+            }),
         }
     }
 
@@ -166,40 +265,158 @@ impl DirectPrepared {
             }
         }
 
+        let mut log_events = Vec::new();
+        if wants_info(&options.diagnostic_level) {
+            push_log_event(
+                &mut log_events,
+                "info",
+                "lastfm_prepare_started",
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "source": "API Key",
+                    "anchors": anchors.len(),
+                    "track_lookups": track_queries.len(),
+                    "artist_lookups": artist_queries.len(),
+                })),
+            );
+        }
         let mut request_count = 0_u64;
         let mut cache_hits = 0_u64;
         let mut tracks = HashMap::<String, Vec<SimilarTrack>>::new();
         let mut misses = Vec::new();
         for (key, (artist, title, mbid)) in &track_queries {
             let cache_key = format!("track:{key}");
-            if let Some(value) = cache.get(&cache_key, now) {
+            let task = FetchTask::Track {
+                cache_key,
+                artist: artist.clone(),
+                title: title.clone(),
+                recording_mbid: mbid.clone(),
+            };
+            if let Some(value) = cache.get(task.cache_key(), now) {
                 cache_hits += 1;
+                let result_count = value.as_array().map(Vec::len).unwrap_or(0);
+                if wants_info(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "info",
+                        "lastfm_lookup_completed",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("hit"),
+                        Some(result_count),
+                        None,
+                    );
+                }
+                if wants_debug(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "debug",
+                        "lastfm_response_json",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("hit"),
+                        Some(result_count),
+                        Some(serde_json::json!({"results": value})),
+                    );
+                }
                 let decoded = serde_json::from_value(value)
                     .map_err(|_| "cached Last.fm track relation is invalid".to_owned())?;
                 tracks.insert(key.clone(), decoded);
             } else {
-                misses.push(FetchTask::Track {
-                    cache_key,
-                    artist: artist.clone(),
-                    title: title.clone(),
-                    recording_mbid: mbid.clone(),
-                });
+                if wants_info(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "info",
+                        "lastfm_lookup_requested",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("miss"),
+                        None,
+                        None,
+                    );
+                }
+                if wants_debug(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "debug",
+                        "lastfm_request_json",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("miss"),
+                        None,
+                        Some(serde_json::json!({"request": task.sanitized_request()})),
+                    );
+                }
+                misses.push(task);
             }
         }
         let mut artists = HashMap::<String, Vec<SimilarArtist>>::new();
         for (key, (artist, mbid)) in &artist_queries {
             let cache_key = format!("artist:{key}");
-            if let Some(value) = cache.get(&cache_key, now) {
+            let task = FetchTask::Artist {
+                cache_key,
+                artist: artist.clone(),
+                artist_mbid: mbid.clone(),
+            };
+            if let Some(value) = cache.get(task.cache_key(), now) {
                 cache_hits += 1;
+                let result_count = value.as_array().map(Vec::len).unwrap_or(0);
+                if wants_info(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "info",
+                        "lastfm_lookup_completed",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("hit"),
+                        Some(result_count),
+                        None,
+                    );
+                }
+                if wants_debug(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "debug",
+                        "lastfm_response_json",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("hit"),
+                        Some(result_count),
+                        Some(serde_json::json!({"results": value})),
+                    );
+                }
                 let decoded = serde_json::from_value(value)
                     .map_err(|_| "cached Last.fm artist relation is invalid".to_owned())?;
                 artists.insert(key.clone(), decoded);
             } else {
-                misses.push(FetchTask::Artist {
-                    cache_key,
-                    artist: artist.clone(),
-                    artist_mbid: mbid.clone(),
-                });
+                if wants_info(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "info",
+                        "lastfm_lookup_requested",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("miss"),
+                        None,
+                        None,
+                    );
+                }
+                if wants_debug(&options.diagnostic_level) {
+                    push_log_event(
+                        &mut log_events,
+                        "debug",
+                        "lastfm_request_json",
+                        Some(task.operation()),
+                        Some(task.source()),
+                        Some("miss"),
+                        None,
+                        Some(serde_json::json!({"request": task.sanitized_request()})),
+                    );
+                }
+                misses.push(task);
             }
         }
 
@@ -207,10 +424,36 @@ impl DirectPrepared {
             values,
             request_count: batch_request_count,
             failure_count: failed_requests,
+            failures,
         } = fetch_concurrently(options, &api_key, deadline, misses);
         request_count += batch_request_count;
         for (task, value) in values {
             let key = task.cache_key().to_owned();
+            let result_count = value.as_array().map(Vec::len).unwrap_or(0);
+            if wants_info(&options.diagnostic_level) {
+                push_log_event(
+                    &mut log_events,
+                    "info",
+                    "lastfm_lookup_completed",
+                    Some(task.operation()),
+                    Some(task.source()),
+                    Some("miss"),
+                    Some(result_count),
+                    None,
+                );
+            }
+            if wants_debug(&options.diagnostic_level) {
+                push_log_event(
+                    &mut log_events,
+                    "debug",
+                    "lastfm_response_json",
+                    Some(task.operation()),
+                    Some(task.source()),
+                    Some("miss"),
+                    Some(result_count),
+                    Some(serde_json::json!({"results": value})),
+                );
+            }
             cache.put(key.clone(), value.clone(), now);
             match task {
                 FetchTask::Track { .. } => {
@@ -224,6 +467,18 @@ impl DirectPrepared {
                     artists.insert(key.trim_start_matches("artist:").to_owned(), decoded);
                 }
             }
+        }
+        for (task, error) in failures {
+            push_log_event(
+                &mut log_events,
+                "warning",
+                "lastfm_lookup_failed",
+                Some(task.operation()),
+                Some(task.source()),
+                Some("miss"),
+                None,
+                Some(serde_json::json!({"error": error})),
+            );
         }
         cache.save()?;
 
@@ -277,6 +532,23 @@ impl DirectPrepared {
         } else {
             "degraded"
         };
+        if wants_info(&options.diagnostic_level) {
+            push_log_event(
+                &mut log_events,
+                "info",
+                "lastfm_prepare_completed",
+                None,
+                None,
+                None,
+                Some(relation_count),
+                Some(serde_json::json!({
+                    "requests": request_count,
+                    "cache_hits": cache_hits,
+                    "failures": failure_count,
+                    "relations": relation_count,
+                })),
+            );
+        }
         Ok((
             prepared,
             Diagnostics {
@@ -287,6 +559,7 @@ impl DirectPrepared {
                     "acquisition_mode": "direct", "cache_hits": cache_hits,
                     "source_anchors": anchors.len(), "relations": relation_count,
                     "failed_requests": failure_count,
+                    "log_events_v1": log_events,
                 })),
             },
         ))
@@ -367,6 +640,7 @@ struct FetchBatch {
     values: Vec<(FetchTask, Value)>,
     request_count: u64,
     failure_count: u64,
+    failures: Vec<(FetchTask, String)>,
 }
 
 fn fetch_concurrently(
@@ -380,11 +654,13 @@ fn fetch_concurrently(
             values: Vec::new(),
             request_count: 0,
             failure_count: 0,
+            failures: Vec::new(),
         };
     }
     let worker_count = options.max_concurrent_requests.min(tasks.len());
     let queue = Arc::new(Mutex::new(VecDeque::from(tasks)));
     let results = Arc::new(Mutex::new(Vec::new()));
+    let failures = Arc::new(Mutex::new(Vec::new()));
     let request_count = Arc::new(AtomicU64::new(0));
     let failure_count = Arc::new(AtomicU64::new(0));
     thread::scope(|scope| {
@@ -393,6 +669,7 @@ fn fetch_concurrently(
             let results = Arc::clone(&results);
             let request_count = Arc::clone(&request_count);
             let failure_count = Arc::clone(&failure_count);
+            let failures = Arc::clone(&failures);
             let endpoint = options.api_endpoint.clone();
             scope.spawn(move || loop {
                 let task = queue
@@ -405,8 +682,12 @@ fn fetch_concurrently(
                         .lock()
                         .expect("direct result lock poisoned")
                         .push((task, value)),
-                    Err(_) => {
+                    Err(error) => {
                         failure_count.fetch_add(1, Ordering::Relaxed);
+                        failures
+                            .lock()
+                            .expect("direct failure lock poisoned")
+                            .push((task, error));
                     }
                 }
             });
@@ -414,10 +695,13 @@ fn fetch_concurrently(
     });
     let mut results = std::mem::take(&mut *results.lock().expect("direct result lock poisoned"));
     results.sort_unstable_by(|left, right| left.0.cache_key().cmp(right.0.cache_key()));
+    let mut failures = std::mem::take(&mut *failures.lock().expect("direct failure lock poisoned"));
+    failures.sort_unstable_by(|left, right| left.0.cache_key().cmp(right.0.cache_key()));
     FetchBatch {
         values: results,
         request_count: request_count.load(Ordering::Relaxed),
         failure_count: failure_count.load(Ordering::Relaxed),
+        failures,
     }
 }
 
