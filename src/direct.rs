@@ -21,6 +21,8 @@ fn wants_debug(level: &str) -> bool {
     level == "debug"
 }
 
+// The remaining parameters mirror the optional fields of guidance_log_event_v1.
+#[allow(clippy::too_many_arguments)]
 fn push_log_event(
     events: &mut Vec<Value>,
     level: &str,
