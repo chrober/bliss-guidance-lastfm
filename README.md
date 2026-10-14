@@ -124,3 +124,19 @@ share. A host can use this metadata to avoid offering an unsupported choice.
 The addon communicates through versioned JSONL on stdin/stdout. It contributes
 bounded guidance only; Bliss acoustic quality and all hard route constraints
 remain optimizer responsibilities.
+
+## Diagnostics
+
+The host can request `warning`, `info`, or `debug` diagnostics through the
+trusted `diagnostic_level` prepare option. The provider emits bounded
+`guidance_log_event_v1` objects inside prepare and score diagnostics:
+
+- warnings for tolerated Last.fm lookup failures;
+- information events for lookup requests, cache hits or fresh result counts,
+  and the preparation summary; and
+- debug events containing sanitized request/result structures and scoring
+  coverage.
+
+The native process never writes human log text to stderr or stdout. The owning
+Lyrion provider validates and renders these events in its own log category.
+API keys and signatures are excluded or redacted before an event is emitted.
