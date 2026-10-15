@@ -2,18 +2,20 @@
 
 `bliss-guidance-lastfm` is a provider addon for a Bliss-first host using the
 [`bliss-playlist-guidance-spi`](https://github.com/chrober/bliss-playlist-guidance-spi).
-The current host is `bliss-playlist-optimizer`. It consumes the existing
-`semantic-evidence-v1` raw artifact
-produced by Better Call Bliss and returns resolved, local-candidate Last.fm
-guidance for the current global or edge route context; unresolved provider
-identities are ignored.
+Current hosts use two acquisition modes. **Artifact mode** consumes a frozen,
+resolved `semantic-evidence-v1` artifact prepared by trusted host code (for
+example through LastMix). **Direct mode** obtains relations once during
+`prepare`, using an API key inherited only through the process environment,
+then freezes them in a versioned local TTL cache. Both modes return the same
+bounded `lastfm_track` and `lastfm_artist` guidance; `score` never performs
+network I/O.
 
 The host-neutral wire contract is maintained by
 [bliss-playlist-guidance-spi](https://github.com/chrober/bliss-playlist-guidance-spi).
 
-Its SPI provider ID is `lastfm-guidance`. It does not contact Last.fm itself;
-Better Call Bliss/LastMix remains responsible for obtaining and caching the raw
-artifact.
+Its SPI provider ID is `lastfm-guidance`. In artifact mode, Better Call Bliss
+and LastMix remain responsible for obtaining and resolving evidence. In direct
+mode, this binary contacts Last.fm only during `prepare`.
 
 This artifact-only boundary is the current behavior. The separate Lyrion
 provider exposes an **API Key** configuration option, but direct HTTP/cache
@@ -44,11 +46,11 @@ resolves those observations against the frozen local candidate inventory and
 writes only resolved local candidate identities into `semantic-evidence-v1`.
 
 This add-on consumes no BlissMixer, BlissMixerLab, LastMix, or Better Call
-Bliss setting directly. Better Call Bliss passes the artifact in an SPI v2
-`prepare` descriptor with its expected SHA-256; the provider verifies the hash
-before decoding it. That separation keeps acquisition, settings interpretation,
-identity matching, and network failures outside the native route-search
-process.
+Bliss setting directly. In artifact mode, Better Call Bliss passes a prepared
+artifact in an SPI v2 `prepare` descriptor with its expected SHA-256; the
+provider verifies the hash before decoding it. In direct mode, the trusted host
+passes non-secret connection limits and supplies the API key through the child
+process environment only.
 
 During `prepare`, the add-on reads the artifact once and builds an index of
 `source entity -> local candidate ID -> channel -> strongest support`. It also
@@ -95,10 +97,17 @@ the host chooses and applies the policy after it receives the same normalized
 track or artist support. In particular, the provider never calculates a target
 share multiplier or ranks candidates itself.
 
-This deliberately separates provider acquisition from optimizer scoring. A
-future transport implementation could fetch anonymous Last.fm data directly, but
-it would need to preserve the same frozen-evidence and failure-tolerant
-contract.
+Direct mode accepts only trusted launch configuration: `acquisition_mode`,
+cache path/TTL, deadline, bounded request concurrency, and (where a test or a
+trusted host needs it) the Last.fm endpoint. Its API key is read solely from
+`BLISS_GUIDANCE_LASTFM_API_KEY`; it is never included in options, requests,
+artifacts, cache entries, diagnostics, or errors. Cache misses are fetched by a
+bounded worker pool (at most `max_concurrent_requests`), and transient `429`,
+`5xx`, and transport failures receive two short deadline-bounded retries.
+Successful empty relations are cached like any other result. When requests
+remain unavailable, `prepare` succeeds in a redacted `degraded` state with
+neutral guidance for those sources, so the host can continue with Bliss-only
+selection.
 
 SPI v2 prepare input:
 
@@ -120,3 +129,19 @@ share. A host can use this metadata to avoid offering an unsupported choice.
 The addon communicates through versioned JSONL on stdin/stdout. It contributes
 bounded guidance only; Bliss acoustic quality and all hard route constraints
 remain optimizer responsibilities.
+
+## Diagnostics
+
+The host can request `warning`, `info`, or `debug` diagnostics through the
+trusted `diagnostic_level` prepare option. The provider emits bounded
+`guidance_log_event_v1` objects inside prepare and score diagnostics:
+
+- warnings for tolerated Last.fm lookup failures;
+- information events for lookup requests, cache hits or fresh result counts,
+  and the preparation summary; and
+- debug events containing sanitized request/result structures and scoring
+  coverage.
+
+The native process never writes human log text to stderr or stdout. The owning
+Lyrion provider validates and renders these events in its own log category.
+API keys and signatures are excluded or redacted before an event is emitted.

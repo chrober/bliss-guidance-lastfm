@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+mod cache;
+mod direct;
+mod lastfm_api;
+
 use bliss_playlist_guidance_spi::policy::HostPolicyKind;
 use bliss_playlist_guidance_spi::{
     encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
@@ -69,8 +73,10 @@ struct Provider {
     // This bridge is derived from the host-provided SPI anchors at prepare
     // time, preferably via MusicBrainz artist IDs.
     artist_sources_by_track: HashMap<String, Vec<String>>,
+    direct: Option<direct::DirectPrepared>,
     snapshot_id: Option<String>,
     prepared: bool,
+    diagnostic_level: String,
 }
 
 #[derive(Clone)]
@@ -110,6 +116,18 @@ impl Provider {
             required_context: vec!["candidate_identity".to_owned(), "route_context".to_owned()],
             configuration_schema: Some(serde_json::json!({
                 "type": "object",
+                "properties": {
+                    "acquisition_mode": {"enum": ["artifact", "direct"]},
+                    "cache_path": {"type": "string"},
+                    "cache_ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 2592000},
+                    "request_deadline_ms": {"type": "integer", "minimum": 100, "maximum": 60000},
+                    "max_concurrent_requests": {"type": "integer", "minimum": 1, "maximum": 8},
+                    "api_endpoint": {"type": "string"},
+                    "lastfm_track_influence": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "lastfm_artist_mode": {"enum": ["target_share", "bounded_influence"]},
+                    "lastfm_artist_level": {"type": "integer", "minimum": 0, "maximum": 100}
+                    ,"diagnostic_level": {"enum": ["warning", "info", "debug"]}
+                },
                 "additionalProperties": false
             })),
         }
@@ -121,6 +139,7 @@ impl Provider {
         _resources: &[bliss_playlist_guidance_spi::ResourceDescriptor],
         anchors: &[bliss_playlist_guidance_spi::Anchor],
     ) -> Result<(Option<String>, Diagnostics), String> {
+        self.direct = None;
         let descriptor = artifacts
             .iter()
             .find(|artifact| artifact.kind == "resolved-lastfm-evidence-v1")
@@ -241,9 +260,42 @@ impl Provider {
                     "resolved_candidate_edges": self.edges.values()
                         .map(|by_candidate| by_candidate.values().map(BTreeMap::len).sum::<usize>())
                         .sum::<usize>(),
+                    "log_events_v1": if wants_info(&self.diagnostic_level) {
+                        vec![provider_log_event(
+                            "info", "prepare", "lastfm_prepare_completed", None, None,
+                            Some(self.edges.values().map(|by_candidate| by_candidate.values().map(BTreeMap::len).sum::<usize>()).sum::<usize>()),
+                            Some(serde_json::json!({
+                                "source": "LastMix",
+                                "source_entities": self.edges.len(),
+                                "track_artist_mappings": self.artist_sources_by_track.len(),
+                            })),
+                        )]
+                    } else { Vec::new() },
                 })),
             },
         ))
+    }
+
+    fn prepare_direct(
+        &mut self,
+        options: &serde_json::Value,
+        anchors: &[bliss_playlist_guidance_spi::Anchor],
+    ) -> Result<(Option<String>, Diagnostics), String> {
+        self.edges.clear();
+        self.artist_sources_by_track.clear();
+        let options = direct::DirectOptions::from_prepare_options(options)?;
+        self.diagnostic_level = options.diagnostic_level.clone();
+        let (prepared, diagnostics) = direct::DirectPrepared::prepare(&options, anchors)?;
+        let snapshot_id = format!(
+            "direct:sources:{}:requests:{}:cache_hits:{}",
+            anchors.len(),
+            prepared.request_count,
+            prepared.cache_hits,
+        );
+        self.snapshot_id = Some(snapshot_id.clone());
+        self.direct = Some(prepared);
+        self.prepared = true;
+        Ok((Some(snapshot_id), diagnostics))
     }
 
     fn score(
@@ -280,6 +332,22 @@ impl Provider {
         source_ids.sort_unstable();
         source_ids.dedup();
         let mut signals = Vec::new();
+        if let Some(direct) = &self.direct {
+            for (candidate_id, channel, score) in direct.signals(context, candidates) {
+                signals.push(
+                    GuidanceSignal {
+                        candidate_id,
+                        channel,
+                        scope: context.scope.clone(),
+                        score,
+                        confidence: 1.0,
+                        rationale: Some("Last.fm direct similarity".to_owned()),
+                        observed_at: None,
+                    }
+                    .bounded(),
+                );
+            }
+        }
         for candidate in candidates {
             let mut best_by_channel: BTreeMap<String, (f64, f64, String, Option<String>)> =
                 BTreeMap::new();
@@ -326,6 +394,31 @@ impl Provider {
             }
         }
         let matched = signals.len();
+        let track_supported = signals
+            .iter()
+            .filter(|signal| signal.channel == "lastfm_track")
+            .count();
+        let artist_supported = signals
+            .iter()
+            .filter(|signal| signal.channel == "lastfm_artist")
+            .count();
+        let log_events = if self.diagnostic_level == "debug" {
+            vec![provider_log_event(
+                "debug",
+                "score",
+                "lastfm_scoring_completed",
+                None,
+                None,
+                Some(matched),
+                Some(serde_json::json!({
+                    "candidates": candidates.len(),
+                    "similar_track_supported": track_supported,
+                    "similar_artist_supported": artist_supported,
+                })),
+            )]
+        } else {
+            Vec::new()
+        };
         GuidanceResponse::Scores {
             provider_id: PROVIDER_ID.to_owned(),
             request_id: request_id.to_owned(),
@@ -334,10 +427,48 @@ impl Provider {
                 state: Some("fresh".to_owned()),
                 request_count: 1,
                 failure_count: 0,
-                details: Some(serde_json::json!({"matched_candidates": matched})),
+                details: Some(serde_json::json!({
+                    "matched_candidates": matched,
+                    "log_events_v1": log_events,
+                })),
             },
         }
     }
+}
+
+fn diagnostic_level(options: &serde_json::Value) -> &str {
+    options
+        .get("diagnostic_level")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| matches!(*value, "warning" | "info" | "debug"))
+        .unwrap_or("warning")
+}
+
+fn wants_info(level: &str) -> bool {
+    matches!(level, "info" | "debug")
+}
+
+fn provider_log_event(
+    level: &str,
+    phase: &str,
+    event: &str,
+    operation: Option<&str>,
+    source: Option<serde_json::Value>,
+    result_count: Option<usize>,
+    details: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event_version": "guidance_log_event_v1",
+        "level": level,
+        "phase": phase,
+        "event": event,
+        "provider_id": PROVIDER_ID,
+        "operation": operation,
+        "source": source,
+        "cache_state": null,
+        "result_count": result_count,
+        "details": details,
+    })
 }
 
 fn normalize_artist_name(name: &str) -> String {
@@ -359,6 +490,7 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
         }
         GuidanceRequest::Prepare {
             spi_version,
+            options,
             artifacts,
             resources,
             anchors,
@@ -372,7 +504,17 @@ fn handle(provider: &mut Provider, request: GuidanceRequest) -> GuidanceResponse
                     retryable: false,
                 };
             }
-            match provider.prepare_with_anchors(&artifacts, &resources, &anchors) {
+            provider.diagnostic_level = diagnostic_level(&options).to_owned();
+            let result = if options
+                .get("acquisition_mode")
+                .and_then(serde_json::Value::as_str)
+                == Some("direct")
+            {
+                provider.prepare_direct(&options, &anchors)
+            } else {
+                provider.prepare_with_anchors(&artifacts, &resources, &anchors)
+            };
+            match result {
                 Ok((snapshot_id, diagnostics)) => GuidanceResponse::Prepared {
                     provider_id: PROVIDER_ID.to_owned(),
                     snapshot_id,
@@ -476,6 +618,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     static FIXTURE_SERIAL: AtomicU64 = AtomicU64::new(0);
 
@@ -496,6 +639,11 @@ mod tests {
             PROVIDER_VERSION.replace('.', "-"),
             FIXTURE_SERIAL.fetch_add(1, Ordering::Relaxed),
         ))
+    }
+
+    fn api_key_environment_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
     }
 
     fn artifact_descriptor(path: &std::path::Path) -> ArtifactDescriptor {
@@ -554,6 +702,19 @@ mod tests {
                 HostPolicyKind::TargetShare
             ]
         );
+    }
+
+    #[test]
+    fn manifest_declares_trusted_direct_prepare_options_without_an_api_key_property() {
+        let schema = Provider::manifest().configuration_schema.unwrap();
+        let properties = schema
+            .get("properties")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert!(properties.contains_key("acquisition_mode"));
+        assert!(properties.contains_key("cache_path"));
+        assert!(properties.contains_key("max_concurrent_requests"));
+        assert!(!properties.contains_key("api_key"));
     }
 
     #[test]
@@ -904,5 +1065,452 @@ mod tests {
         assert_eq!(signals[0].channel, "lastfm_artist");
         assert_eq!(signals[1].channel, "lastfm_track");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn direct_prepare_options_keep_api_key_outside_json_and_require_process_environment() {
+        let _api_key_environment = api_key_environment_lock();
+        let options = serde_json::json!({
+            "acquisition_mode": "direct",
+            "cache_path": "/trusted/cache/lastfm-v1.json",
+            "cache_ttl_seconds": 3600,
+            "request_deadline_ms": 5000,
+            "max_concurrent_requests": 2
+        });
+        let parsed = crate::direct::DirectOptions::from_prepare_options(&options).unwrap();
+        assert_eq!(parsed.cache_ttl_seconds, 3600);
+        assert!(parsed.api_key_from_environment().is_err());
+        assert!(!serde_json::to_string(&options).unwrap().contains("api_key"));
+    }
+
+    #[test]
+    fn direct_cache_keeps_fresh_values_and_expires_old_values() {
+        let path = fixture_path();
+        let mut cache = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        cache.put(
+            "artist:seed",
+            serde_json::json!({"artists": ["related"]}),
+            100,
+        );
+        cache.save().unwrap();
+
+        let cache = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        assert_eq!(
+            cache.get("artist:seed", 159),
+            Some(serde_json::json!({"artists": ["related"]}))
+        );
+        assert_eq!(cache.get("artist:seed", 160), None);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn direct_cache_merges_entries_written_by_overlapping_provider_sessions() {
+        let path = fixture_path();
+        let mut first = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        let mut second = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        first.put("artist:first", serde_json::json!(["one"]), 100);
+        second.put("artist:second", serde_json::json!(["two"]), 101);
+
+        first.save().unwrap();
+        second.save().unwrap();
+
+        let merged = crate::cache::PersistentCache::load(&path, 60).unwrap();
+        assert_eq!(
+            merged.get("artist:first", 101),
+            Some(serde_json::json!(["one"]))
+        );
+        assert_eq!(
+            merged.get("artist:second", 101),
+            Some(serde_json::json!(["two"]))
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("lock"));
+    }
+
+    #[test]
+    fn direct_lastfm_parser_prefers_mbid_identities_without_retaining_api_configuration() {
+        let payload = serde_json::json!({
+            "similartracks": {"track": [{
+                "name": "Related Song", "mbid": "recording-mbid-2", "match": 0.9,
+                "artist": {"name": "Related Artist", "mbid": "artist-mbid-2"}
+            }]}
+        });
+        let tracks = crate::lastfm_api::parse_similar_tracks(&payload).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(
+            tracks[0].recording_mbid.as_deref(),
+            Some("recording-mbid-2")
+        );
+        assert_eq!(tracks[0].artist_mbid.as_deref(), Some("artist-mbid-2"));
+        assert!(!format!("{tracks:?}").contains("api_key"));
+    }
+
+    #[test]
+    fn direct_lastfm_parser_negative_caches_unknown_tracks_and_artists() {
+        let not_found = serde_json::json!({"error": 6, "message": "not found"});
+        assert!(crate::lastfm_api::parse_similar_tracks(&not_found)
+            .unwrap()
+            .is_empty());
+        assert!(crate::lastfm_api::parse_similar_artists(&not_found)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn direct_lastfm_client_queries_a_trusted_endpoint_without_exposing_the_api_key_in_errors() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 4096];
+            let received = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..received]);
+            assert!(request.contains("method=track.getSimilar"));
+            assert!(request.contains("limit=25"));
+            let body = r#"{"similartracks":{"track":[{"name":"Related Song","mbid":"recording-mbid-2","match":0.9,"artist":{"name":"Related Artist","mbid":"artist-mbid-2"}}]}}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        });
+
+        let client =
+            crate::lastfm_api::LastFmClient::new(&endpoint, "test-api-key", Duration::from_secs(2))
+                .unwrap();
+        let tracks = client
+            .similar_tracks("Seed Artist", "Seed Song", Some("recording-mbid-1"))
+            .unwrap();
+        assert_eq!(tracks[0].title, "Related Song");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn direct_prepare_freezes_lastfm_relations_and_score_makes_no_network_request() {
+        let _api_key_environment = api_key_environment_lock();
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let received = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..received]);
+                let body = if request.contains("method=track.getSimilar") {
+                    r#"{"similartracks":{"track":[{"name":"Related Song","mbid":"recording-mbid-2","match":0.9,"artist":{"name":"Related Artist","mbid":"artist-mbid-2"}}]}}"#
+                } else {
+                    assert!(request.contains("method=artist.getSimilar"));
+                    r#"{"similarartists":{"artist":[{"name":"Related Artist","mbid":"artist-mbid-2","match":0.8}]}}"#
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            }
+        });
+        let cache_path = fixture_path();
+        std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
+        let options = serde_json::json!({
+            "acquisition_mode": "direct", "api_endpoint": endpoint,
+            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "request_deadline_ms": 5000, "max_concurrent_requests": 2,
+            "diagnostic_level": "debug",
+        });
+        let anchors = vec![bliss_playlist_guidance_spi::Anchor {
+            anchor_id: "lms-track-1".to_owned(),
+            track: Candidate {
+                candidate_id: "lms-track-1".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: Some("Seed Song".to_owned()),
+                artist: Some("Seed Artist".to_owned()),
+                album: None,
+                recording_mbid: Some("recording-mbid-1".to_owned()),
+                artist_mbids: vec!["artist-mbid-1".to_owned()],
+            },
+        }];
+        let mut provider = Provider::default();
+        let (_, prepare_diagnostics) = provider.prepare_direct(&options, &anchors).unwrap();
+        server.join().unwrap();
+
+        let prepare_events = prepare_diagnostics.details.as_ref().unwrap()["log_events_v1"]
+            .as_array()
+            .unwrap();
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "lastfm_lookup_requested"));
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "lastfm_lookup_completed"));
+        assert!(prepare_events
+            .iter()
+            .any(|event| event["event"] == "lastfm_response_json"));
+        assert!(!serde_json::to_string(prepare_events)
+            .unwrap()
+            .contains("test-api-key"));
+
+        let response = provider.score(
+            "direct-score",
+            &bliss_playlist_guidance_spi::ScoreContext {
+                scope: GuidanceScope::Global,
+                left_anchor_id: None,
+                right_anchor_id: None,
+                context_track_ids: vec!["lms-track-1".to_owned()],
+            },
+            &[Candidate {
+                candidate_id: "candidate-1".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: Some("Related Song".to_owned()),
+                artist: Some("Related Artist".to_owned()),
+                album: None,
+                recording_mbid: Some("recording-mbid-2".to_owned()),
+                artist_mbids: vec!["artist-mbid-2".to_owned()],
+            }],
+        );
+        let GuidanceResponse::Scores {
+            signals,
+            diagnostics,
+            ..
+        } = response
+        else {
+            panic!("expected scores");
+        };
+        assert_eq!(signals.len(), 2);
+        assert_eq!(signals[0].channel, "lastfm_artist");
+        assert_eq!(signals[1].channel, "lastfm_track");
+        assert!(diagnostics.details.as_ref().unwrap()["log_events_v1"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["event"] == "lastfm_scoring_completed"));
+        std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn direct_prepare_uses_the_configured_bounded_request_concurrency() {
+        let _api_key_environment = api_key_environment_lock();
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let server = thread::spawn({
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            move || {
+                let mut handlers = Vec::new();
+                for _ in 0..4 {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let active = Arc::clone(&active);
+                    let peak = Arc::clone(&peak);
+                    handlers.push(thread::spawn(move || {
+                        let mut request = [0_u8; 4096];
+                        let received = stream.read(&mut request).unwrap();
+                        let request = String::from_utf8_lossy(&request[..received]);
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now_active, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(100));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        let body = if request.contains("method=track.getSimilar") {
+                            r#"{"similartracks":{"track":[]}}"#
+                        } else {
+                            assert!(request.contains("method=artist.getSimilar"));
+                            r#"{"similarartists":{"artist":[]}}"#
+                        };
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                    }));
+                }
+                for handler in handlers {
+                    handler.join().unwrap();
+                }
+            }
+        });
+        let cache_path = fixture_path();
+        std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
+        let options = serde_json::json!({
+            "acquisition_mode": "direct", "api_endpoint": endpoint,
+            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "request_deadline_ms": 5000, "max_concurrent_requests": 2,
+        });
+        let anchors = ["one", "two"]
+            .into_iter()
+            .map(|suffix| bliss_playlist_guidance_spi::Anchor {
+                anchor_id: format!("anchor-{suffix}"),
+                track: Candidate {
+                    candidate_id: format!("anchor-{suffix}"),
+                    lms_urlmd5: None,
+                    database_file: None,
+                    title: Some(format!("Seed Song {suffix}")),
+                    artist: Some(format!("Seed Artist {suffix}")),
+                    album: None,
+                    recording_mbid: None,
+                    artist_mbids: vec![],
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let mut provider = Provider::default();
+        provider.prepare_direct(&options, &anchors).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(peak.load(Ordering::SeqCst), 2);
+        std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn direct_prepare_retries_a_transient_lastfm_rate_limit() {
+        let _api_key_environment = api_key_environment_lock();
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut requests = 0;
+            while requests < 4 && Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        let mut request = [0_u8; 4096];
+                        let received = stream.read(&mut request).unwrap();
+                        let request = String::from_utf8_lossy(&request[..received]);
+                        let status = if requests % 2 == 0 { 429 } else { 200 };
+                        let body = if status == 429 {
+                            r#"{"error":29,"message":"Rate limit exceeded"}"#
+                        } else if request.contains("method=track.getSimilar") {
+                            r#"{"similartracks":{"track":[]}}"#
+                        } else {
+                            r#"{"similarartists":{"artist":[]}}"#
+                        };
+                        write!(stream, "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", status, if status == 200 { "OK" } else { "Too Many Requests" }, body.len(), body).unwrap();
+                        requests += 1;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("mock Last.fm listener failed: {error}"),
+                }
+            }
+            requests
+        });
+        let cache_path = fixture_path();
+        std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
+        let options = serde_json::json!({
+            "acquisition_mode": "direct", "api_endpoint": endpoint,
+            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "request_deadline_ms": 5000, "max_concurrent_requests": 1,
+        });
+        let anchors = vec![bliss_playlist_guidance_spi::Anchor {
+            anchor_id: "anchor-one".to_owned(),
+            track: Candidate {
+                candidate_id: "anchor-one".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: Some("Seed Song".to_owned()),
+                artist: Some("Seed Artist".to_owned()),
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            },
+        }];
+
+        let mut provider = Provider::default();
+        assert!(provider.prepare_direct(&options, &anchors).is_ok());
+        assert_eq!(server.join().unwrap(), 4);
+        std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn direct_prepare_degrades_to_neutral_guidance_when_lastfm_is_unavailable() {
+        let _api_key_environment = api_key_environment_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let cache_path = fixture_path();
+        std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
+        let options = serde_json::json!({
+            "acquisition_mode": "direct", "api_endpoint": endpoint,
+            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "request_deadline_ms": 1000, "max_concurrent_requests": 2,
+        });
+        let anchors = vec![bliss_playlist_guidance_spi::Anchor {
+            anchor_id: "anchor-one".to_owned(),
+            track: Candidate {
+                candidate_id: "anchor-one".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: Some("Seed Song".to_owned()),
+                artist: Some("Seed Artist".to_owned()),
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            },
+        }];
+
+        let mut provider = Provider::default();
+        let (_, diagnostics) = provider.prepare_direct(&options, &anchors).unwrap();
+        assert_eq!(diagnostics.state.as_deref(), Some("degraded"));
+        assert_eq!(diagnostics.failure_count, 2);
+        std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
+        let _ = fs::remove_file(cache_path);
+    }
+
+    #[test]
+    fn direct_prepare_never_serializes_the_process_only_api_key() {
+        let _api_key_environment = api_key_environment_lock();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        let cache_path = fixture_path();
+        let secret = "lastfm-secret-must-not-escape";
+        std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, secret);
+        let options = serde_json::json!({
+            "acquisition_mode": "direct", "api_endpoint": endpoint,
+            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "request_deadline_ms": 1000, "max_concurrent_requests": 1,
+        });
+        let anchors = vec![bliss_playlist_guidance_spi::Anchor {
+            anchor_id: "anchor-one".to_owned(),
+            track: Candidate {
+                candidate_id: "anchor-one".to_owned(),
+                lms_urlmd5: None,
+                database_file: None,
+                title: Some("Seed Song".to_owned()),
+                artist: Some("Seed Artist".to_owned()),
+                album: None,
+                recording_mbid: None,
+                artist_mbids: vec![],
+            },
+        }];
+
+        let mut provider = Provider::default();
+        let (snapshot_id, diagnostics) = provider.prepare_direct(&options, &anchors).unwrap();
+        let cache = std::fs::read_to_string(&cache_path).unwrap_or_default();
+        let serialized = serde_json::to_string(&serde_json::json!({
+            "options": options,
+            "snapshot_id": snapshot_id,
+            "diagnostics": diagnostics,
+        }))
+        .unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!cache.contains(secret));
+        std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
+        let _ = fs::remove_file(cache_path);
     }
 }
