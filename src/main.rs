@@ -343,6 +343,7 @@ impl Provider {
                         confidence: 1.0,
                         rationale: Some("Last.fm direct similarity".to_owned()),
                         observed_at: None,
+                        observation: None,
                     }
                     .bounded(),
                 );
@@ -388,6 +389,7 @@ impl Provider {
                         confidence: confidence.clamp(0.0, 1.0),
                         rationale: Some(format!("Last.fm similar {kind}")),
                         observed_at,
+                        observation: None,
                     }
                     .bounded(),
                 );

@@ -13,47 +13,41 @@ network I/O.
 The host-neutral wire contract is maintained by
 [bliss-playlist-guidance-spi](https://github.com/chrober/bliss-playlist-guidance-spi).
 
-Its SPI provider ID is `lastfm-guidance`. In artifact mode, Better Call Bliss
-and LastMix remain responsible for obtaining and resolving evidence. In direct
-mode, this binary contacts Last.fm only during `prepare`.
-
-This artifact-only boundary is the current behavior. The separate Lyrion
-provider exposes an **API Key** configuration option, but direct HTTP/cache
-acquisition is not implemented end to end yet; API-key mode therefore remains
-neutral until that provider work is released.
+Its SPI provider ID is `lastfm-guidance`. In artifact mode, trusted Lyrion host
+code and LastMix obtain and resolve evidence. In direct mode, this binary
+contacts Last.fm only during `prepare`.
 
 ## Data and information flow
 
 ```mermaid
 flowchart LR
-    S[Better Call Bliss job settings] --> B[Better Call Bliss]
-    L[LastMix anonymous Last.fm adapter] --> B
-    B -->|cache or fresh requests| E[semantic-evidence-v1 artifact]
-    I[Frozen LMS/Bliss candidate inventory] --> B
-    B -->|resolve provider entities to bliss-row IDs| E
-    E -->|hash-bound artifact descriptor| P[bliss-guidance-lastfm]
-    A[Route anchors\ntrack IDs plus artist MBIDs and names] -->|prepare| P
-    C[Bounded candidates plus\ntrack-context IDs] -->|score| P
-    P -->|context-scoped GuidanceSignal| O[Optimizer guidance host]
+    S[Provider settings and host policy] --> H[Trusted native host]
+    L[LastMix adapter] --> E[Resolved LastMix artifact]
+    E -->|artifact prepare| P[bliss-guidance-lastfm]
+    K[API key in child environment] -->|direct prepare| P
+    F[(Last.fm API and persistent cache)] -->|direct prepare only| P
+    A[Route anchors\ntrack IDs and metadata] -->|prepare| P
+    H -->|bounded candidates and context| P
+    P -->|GuidanceSignal and diagnostics| H
 ```
 
-Better Call Bliss owns all user-facing Last.fm configuration: whether Last.fm
-guidance is enabled and the per-job similar-track and similar-artist guidance
-percentages. It uses its LastMix integration to collect track- and
-artist-similarity observations, tolerates unavailable network access, and can
-reuse cached observations. Before launching the optimizer, Better Call Bliss
-resolves those observations against the frozen local candidate inventory and
-writes only resolved local candidate identities into `semantic-evidence-v1`.
+The separately installed Lyrion provider owns the LastMix/API Key choice and
+its default channel settings. A compatible host owns opt-in and optional
+host/job overrides. In LastMix mode, trusted host integration resolves track-
+and artist-similarity observations against the frozen local inventory and
+writes only resolved candidate identities into `semantic-evidence-v1`.
 
-This add-on consumes no BlissMixer, BlissMixerLab, LastMix, or Better Call
-Bliss setting directly. In artifact mode, Better Call Bliss passes a prepared
-artifact in an SPI v2 `prepare` descriptor with its expected SHA-256; the
-provider verifies the hash before decoding it. In direct mode, the trusted host
-passes non-secret connection limits and supplies the API key through the child
-process environment only.
+This add-on consumes no Lyrion-plugin preference directly. In artifact mode, a
+trusted host passes a prepared artifact in an SPI v2 `prepare` descriptor with
+its expected SHA-256; the provider verifies the hash before decoding it. In
+direct mode, the trusted host passes non-secret connection limits and supplies
+the API key through the child process environment only.
 
-During `prepare`, the add-on reads the artifact once and builds an index of
-`source entity -> local candidate ID -> channel -> strongest support`. It also
+During artifact-mode `prepare`, the add-on reads the artifact once and builds
+an index of `source entity -> local candidate ID -> channel -> strongest
+support`. During direct-mode `prepare`, it resolves the requested anchor
+relations from its persistent cache or bounded HTTP requests and builds the
+same in-memory shape. It also
 uses the supplied local anchors to build `track anchor ID -> Last.fm artist
 source ID(s)`: it joins an anchor's artist MBID to an artist edge's MBID first,
 then uses a normalized artist-name fallback only when no MBID relation exists.
