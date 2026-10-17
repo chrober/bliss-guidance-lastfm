@@ -34,8 +34,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all-features
+      - run: cargo clippy --locked --all-targets --all-features -- -D warnings
+      - run: cargo test --locked --all-features
 
   build:
     name: Build ${{ matrix.asset }}
@@ -147,7 +147,7 @@ jobs:
           PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || false }}
         run: |
           set -euo pipefail
-          printf '# bliss-guidance-lastfm %s\n\nNative guidance-provider binaries for Better Call Bliss.\n\nBuilt from commit %s after fmt, clippy, and test gates.\n' "$VERSION" "$GITHUB_SHA" > release-notes.md
+          printf '# bliss-guidance-lastfm %s\n\nNative Last.fm guidance-provider binaries for compatible Bliss guidance hosts.\n\nBuilt from commit %s after fmt, clippy, and test gates.\n' "$VERSION" "$GITHUB_SHA" > release-notes.md
           prerelease_flag=()
           if [ "$PRERELEASE" = true ]; then prerelease_flag=(--prerelease); fi
           if gh release view "$TAG" >/dev/null 2>&1; then gh release upload "$TAG" release-assets/* --clobber; else gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --title "bliss-guidance-lastfm $VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"; fi
