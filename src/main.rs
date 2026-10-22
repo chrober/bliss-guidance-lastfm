@@ -721,6 +721,43 @@ mod tests {
     }
 
     #[test]
+    fn artifact_prepare_never_opens_or_creates_direct_graph_files() {
+        let artifact_path = fixture_path();
+        fs::write(
+            &artifact_path,
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 1,
+                "edges": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let graph_path = fixture_path().with_extension("sqlite");
+        let legacy_path = fixture_path().with_extension("legacy.json");
+        let mut provider = Provider::default();
+        let response = handle(
+            &mut provider,
+            GuidanceRequest::Prepare {
+                spi_version: SPI_VERSION,
+                job_id: "artifact-no-graph-io".to_owned(),
+                options: serde_json::json!({
+                    "acquisition_mode": "artifact",
+                    "store_path": graph_path,
+                    "legacy_cache_path": legacy_path,
+                }),
+                artifacts: vec![artifact_descriptor(&artifact_path)],
+                resources: vec![],
+                anchors: vec![],
+            },
+        );
+
+        assert!(matches!(response, GuidanceResponse::Prepared { .. }));
+        assert!(!graph_path.exists());
+        assert!(!legacy_path.exists());
+        let _ = fs::remove_file(artifact_path);
+    }
+
+    #[test]
     fn score_uses_either_available_anchor_and_ignores_unresolved_edges() {
         let path = fixture_path();
         let artifact = serde_json::json!({

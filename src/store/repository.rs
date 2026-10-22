@@ -93,6 +93,64 @@ pub struct TrackRecord {
     pub normalized_title: String,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackEdgeRecord {
+    pub target_track_id: i64,
+    pub rank: u32,
+    pub match_score: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrackObservationRecord {
+    pub source_track_id: i64,
+    pub fetched_at: i64,
+    pub validated_at: i64,
+    pub changed_at: i64,
+    pub expires_at: i64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub payload_hash: String,
+    pub acquisition_source: String,
+    pub requested_limit: u32,
+    pub actual_result_count: u32,
+    pub result_status: ObservationStatus,
+    pub edges: Vec<TrackEdgeRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyArtistTarget {
+    pub identity: ArtistIdentity,
+    pub rank: u32,
+    pub match_score: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyArtistObservation {
+    pub source: ArtistIdentity,
+    pub observation: ArtistObservationWrite,
+    pub targets: Vec<LegacyArtistTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyTrackTarget {
+    pub identity: TrackIdentity,
+    pub rank: u32,
+    pub match_score: Option<f64>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LegacyTrackObservation {
+    pub source: TrackIdentity,
+    pub observation: ArtistObservationWrite,
+    pub targets: Vec<LegacyTrackTarget>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LegacyGraphImport {
+    pub artists: Vec<LegacyArtistObservation>,
+    pub tracks: Vec<LegacyTrackObservation>,
+}
+
 #[derive(Debug)]
 pub struct GraphStore {
     connection: Connection,
@@ -445,6 +503,34 @@ impl GraphStore {
             .map_err(|error| format!("cannot read Last.fm graph track: {error}"))
     }
 
+    pub fn find_track(&self, identity: &TrackIdentity) -> Result<Option<i64>, String> {
+        if let Some(mbid) = normalized_mbid(identity.recording_mbid.as_deref()) {
+            if let Some(track_id) = self
+                .connection
+                .query_row(
+                    "SELECT track_id FROM tracks WHERE recording_mbid = ?1",
+                    [mbid],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("cannot resolve Last.fm graph track MBID: {error}"))?
+            {
+                return Ok(Some(track_id));
+            }
+        }
+        let Some(artist_id) = self.find_artist(&identity.artist)? else {
+            return Ok(None);
+        };
+        self.connection
+            .query_row(
+                "SELECT track_id FROM tracks WHERE artist_id = ?1 AND normalized_title = ?2",
+                params![artist_id, normalize_name(&identity.title)],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve Last.fm graph track fallback: {error}"))
+    }
+
     pub fn replace_artist_observation(
         &mut self,
         source_artist_id: i64,
@@ -455,60 +541,7 @@ impl GraphStore {
             .connection
             .transaction()
             .map_err(|error| format!("cannot start Last.fm graph transaction: {error}"))?;
-        let query_id: i64 = transaction
-            .query_row(
-                r#"
-                INSERT INTO artist_queries(
-                    source_artist_id, fetched_at, validated_at, changed_at,
-                    expires_at, etag, last_modified, payload_hash,
-                    acquisition_source, requested_limit, actual_result_count,
-                    result_status
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                ON CONFLICT(source_artist_id) DO UPDATE SET
-                    fetched_at = excluded.fetched_at,
-                    validated_at = excluded.validated_at,
-                    changed_at = excluded.changed_at,
-                    expires_at = excluded.expires_at,
-                    etag = excluded.etag,
-                    last_modified = excluded.last_modified,
-                    payload_hash = excluded.payload_hash,
-                    acquisition_source = excluded.acquisition_source,
-                    requested_limit = excluded.requested_limit,
-                    actual_result_count = excluded.actual_result_count,
-                    result_status = excluded.result_status
-                RETURNING query_id
-                "#,
-                params![
-                    source_artist_id,
-                    observation.fetched_at,
-                    observation.validated_at,
-                    observation.changed_at,
-                    observation.expires_at,
-                    observation.etag,
-                    observation.last_modified,
-                    observation.payload_hash,
-                    observation.acquisition_source,
-                    observation.requested_limit,
-                    observation.actual_result_count,
-                    observation.result_status.as_str(),
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|error| format!("cannot replace Last.fm artist observation: {error}"))?;
-        transaction
-            .execute(
-                "DELETE FROM artist_similarity_edges WHERE query_id = ?1",
-                [query_id],
-            )
-            .map_err(|error| format!("cannot replace Last.fm artist similarity edges: {error}"))?;
-        for edge in edges {
-            transaction
-                .execute(
-                    "INSERT INTO artist_similarity_edges(query_id, target_artist_id, rank, match_score) VALUES (?1, ?2, ?3, ?4)",
-                    params![query_id, edge.target_artist_id, edge.rank, edge.match_score],
-                )
-                .map_err(|error| format!("cannot insert Last.fm artist similarity edge: {error}"))?;
-        }
+        replace_artist_observation_on(&transaction, source_artist_id, observation, edges)?;
         transaction
             .commit()
             .map_err(|error| format!("cannot commit Last.fm artist observation: {error}"))
@@ -597,6 +630,437 @@ impl GraphStore {
             edges,
         }))
     }
+
+    pub fn track_observation(
+        &self,
+        source_track_id: i64,
+    ) -> Result<Option<TrackObservationRecord>, String> {
+        let row = self
+            .connection
+            .query_row(
+                r#"
+                SELECT query_id, fetched_at, validated_at, changed_at, expires_at,
+                       etag, last_modified, payload_hash, acquisition_source,
+                       requested_limit, actual_result_count, result_status
+                FROM track_queries WHERE source_track_id = ?1
+                "#,
+                [source_track_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, u32>(9)?,
+                        row.get::<_, u32>(10)?,
+                        row.get::<_, String>(11)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read Last.fm track observation: {error}"))?;
+        let Some((
+            query_id,
+            fetched_at,
+            validated_at,
+            changed_at,
+            expires_at,
+            etag,
+            last_modified,
+            payload_hash,
+            acquisition_source,
+            requested_limit,
+            actual_result_count,
+            result_status,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT target_track_id, rank, match_score FROM track_similarity_edges WHERE query_id = ?1 ORDER BY rank, target_track_id",
+            )
+            .map_err(|error| format!("cannot prepare Last.fm track edge lookup: {error}"))?;
+        let edges = statement
+            .query_map([query_id], |row| {
+                Ok(TrackEdgeRecord {
+                    target_track_id: row.get(0)?,
+                    rank: row.get(1)?,
+                    match_score: row.get(2)?,
+                })
+            })
+            .map_err(|error| format!("cannot read Last.fm track similarity edges: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode Last.fm track similarity edge: {error}"))?;
+        Ok(Some(TrackObservationRecord {
+            source_track_id,
+            fetched_at,
+            validated_at,
+            changed_at,
+            expires_at,
+            etag,
+            last_modified,
+            payload_hash,
+            acquisition_source,
+            requested_limit,
+            actual_result_count,
+            result_status: ObservationStatus::parse(&result_status)?,
+            edges,
+        }))
+    }
+
+    pub fn migrated_from_json_at(&self) -> Result<Option<i64>, String> {
+        self.connection
+            .query_row(
+                "SELECT migrated_from_json_at FROM metadata WHERE metadata_id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("cannot read Last.fm graph migration state: {error}"))
+    }
+
+    pub fn import_legacy_graph(
+        &mut self,
+        import: &LegacyGraphImport,
+        migrated_at: i64,
+    ) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("cannot start Last.fm cache migration: {error}"))?;
+        for entry in &import.artists {
+            let source = resolve_or_create_artist_on(
+                &transaction,
+                &entry.source,
+                entry.observation.fetched_at,
+            )?;
+            let mut edges = Vec::with_capacity(entry.targets.len());
+            for target in &entry.targets {
+                let target_artist_id = resolve_or_create_artist_on(
+                    &transaction,
+                    &target.identity,
+                    entry.observation.fetched_at,
+                )?;
+                edges.push(ArtistEdgeWrite {
+                    target_artist_id,
+                    rank: target.rank,
+                    match_score: target.match_score,
+                });
+            }
+            replace_artist_observation_on(&transaction, source, &entry.observation, &edges)?;
+        }
+        for entry in &import.tracks {
+            let source = resolve_or_create_track_on(
+                &transaction,
+                &entry.source,
+                entry.observation.fetched_at,
+            )?;
+            let mut targets = Vec::with_capacity(entry.targets.len());
+            for target in &entry.targets {
+                let target_track_id = resolve_or_create_track_on(
+                    &transaction,
+                    &target.identity,
+                    entry.observation.fetched_at,
+                )?;
+                targets.push((target_track_id, target.rank, target.match_score));
+            }
+            replace_track_observation_on(&transaction, source, &entry.observation, &targets)?;
+        }
+        transaction
+            .execute(
+                "UPDATE metadata SET migrated_from_json_at = ?1 WHERE metadata_id = 1",
+                [migrated_at],
+            )
+            .map_err(|error| format!("cannot mark Last.fm cache migration complete: {error}"))?;
+        transaction
+            .commit()
+            .map_err(|error| format!("cannot commit Last.fm cache migration: {error}"))
+    }
+}
+
+fn resolve_or_create_artist_on(
+    connection: &Connection,
+    identity: &ArtistIdentity,
+    now: i64,
+) -> Result<i64, String> {
+    let mbid = normalized_mbid(identity.mbid.as_deref());
+    let name = identity.name.trim();
+    if name.is_empty() {
+        return Err("Last.fm graph artist name is empty".to_owned());
+    }
+    let normalized = normalize_name(name);
+    let existing = if let Some(mbid) = mbid.as_deref() {
+        let by_mbid = connection
+            .query_row(
+                "SELECT artist_id FROM artists WHERE artist_mbid = ?1",
+                [mbid],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve Last.fm graph artist MBID: {error}"))?;
+        if by_mbid.is_some() {
+            by_mbid
+        } else {
+            let name_only = connection
+                .query_row(
+                    "SELECT artist_id FROM artists WHERE artist_mbid IS NULL AND normalized_name = ?1",
+                    [&normalized],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| format!("cannot resolve Last.fm name-only artist: {error}"))?;
+            if let Some(artist_id) = name_only {
+                connection
+                    .execute(
+                        "UPDATE artists SET artist_mbid = ?1 WHERE artist_id = ?2",
+                        params![mbid, artist_id],
+                    )
+                    .map_err(|error| {
+                        format!("cannot promote Last.fm graph artist identity: {error}")
+                    })?;
+            }
+            name_only
+        }
+    } else {
+        connection
+            .query_row(
+                "SELECT artist_id FROM artists WHERE artist_mbid IS NULL AND normalized_name = ?1",
+                [&normalized],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve Last.fm graph artist: {error}"))?
+    };
+    let artist_id = if let Some(artist_id) = existing {
+        connection
+            .execute(
+                "UPDATE artists SET canonical_name = ?1, normalized_name = ?2, last_seen_at = ?3 WHERE artist_id = ?4",
+                params![name, normalized, now, artist_id],
+            )
+            .map_err(|error| format!("cannot update Last.fm graph artist: {error}"))?;
+        artist_id
+    } else {
+        connection
+            .execute(
+                "INSERT INTO artists(artist_mbid, canonical_name, normalized_name, first_seen_at, last_seen_at) VALUES (?1, ?2, ?3, ?4, ?4)",
+                params![mbid, name, normalized, now],
+            )
+            .map_err(|error| format!("cannot insert Last.fm graph artist: {error}"))?;
+        connection.last_insert_rowid()
+    };
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO artist_aliases(artist_id, alias_kind, display_value, normalized_value) VALUES (?1, 'name', ?2, ?3)",
+            params![artist_id, name, normalized],
+        )
+        .map_err(|error| format!("cannot insert Last.fm graph artist alias: {error}"))?;
+    Ok(artist_id)
+}
+
+fn resolve_or_create_track_on(
+    connection: &Connection,
+    identity: &TrackIdentity,
+    now: i64,
+) -> Result<i64, String> {
+    let artist_id = resolve_or_create_artist_on(connection, &identity.artist, now)?;
+    let recording_mbid = normalized_mbid(identity.recording_mbid.as_deref());
+    let title = identity.title.trim();
+    if title.is_empty() {
+        return Err("Last.fm graph track title is empty".to_owned());
+    }
+    let normalized_title = normalize_name(title);
+    let existing = if let Some(mbid) = recording_mbid.as_deref() {
+        let by_mbid = connection
+            .query_row(
+                "SELECT track_id FROM tracks WHERE recording_mbid = ?1",
+                [mbid],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve Last.fm graph recording MBID: {error}"))?;
+        if by_mbid.is_some() {
+            by_mbid
+        } else {
+            let name_only = connection
+                .query_row(
+                    "SELECT track_id FROM tracks WHERE recording_mbid IS NULL AND artist_id = ?1 AND normalized_title = ?2",
+                    params![artist_id, normalized_title],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| format!("cannot resolve Last.fm name-only track: {error}"))?;
+            if let Some(track_id) = name_only {
+                connection
+                    .execute(
+                        "UPDATE tracks SET recording_mbid = ?1 WHERE track_id = ?2",
+                        params![mbid, track_id],
+                    )
+                    .map_err(|error| {
+                        format!("cannot promote Last.fm graph recording identity: {error}")
+                    })?;
+            }
+            name_only
+        }
+    } else {
+        connection
+            .query_row(
+                "SELECT track_id FROM tracks WHERE recording_mbid IS NULL AND artist_id = ?1 AND normalized_title = ?2",
+                params![artist_id, normalized_title],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("cannot resolve Last.fm graph track: {error}"))?
+    };
+    let track_id = if let Some(track_id) = existing {
+        connection
+            .execute(
+                "UPDATE tracks SET artist_id = ?1, canonical_title = ?2, normalized_title = ?3 WHERE track_id = ?4",
+                params![artist_id, title, normalized_title, track_id],
+            )
+            .map_err(|error| format!("cannot update Last.fm graph track: {error}"))?;
+        track_id
+    } else {
+        connection
+            .execute(
+                "INSERT INTO tracks(recording_mbid, artist_id, canonical_title, normalized_title) VALUES (?1, ?2, ?3, ?4)",
+                params![recording_mbid, artist_id, title, normalized_title],
+            )
+            .map_err(|error| format!("cannot insert Last.fm graph track: {error}"))?;
+        connection.last_insert_rowid()
+    };
+    Ok(track_id)
+}
+
+fn replace_artist_observation_on(
+    connection: &Connection,
+    source_artist_id: i64,
+    observation: &ArtistObservationWrite,
+    edges: &[ArtistEdgeWrite],
+) -> Result<(), String> {
+    let query_id: i64 = connection
+        .query_row(
+            r#"
+            INSERT INTO artist_queries(
+                source_artist_id, fetched_at, validated_at, changed_at,
+                expires_at, etag, last_modified, payload_hash,
+                acquisition_source, requested_limit, actual_result_count,
+                result_status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(source_artist_id) DO UPDATE SET
+                fetched_at = excluded.fetched_at,
+                validated_at = excluded.validated_at,
+                changed_at = excluded.changed_at,
+                expires_at = excluded.expires_at,
+                etag = excluded.etag,
+                last_modified = excluded.last_modified,
+                payload_hash = excluded.payload_hash,
+                acquisition_source = excluded.acquisition_source,
+                requested_limit = excluded.requested_limit,
+                actual_result_count = excluded.actual_result_count,
+                result_status = excluded.result_status
+            RETURNING query_id
+            "#,
+            params![
+                source_artist_id,
+                observation.fetched_at,
+                observation.validated_at,
+                observation.changed_at,
+                observation.expires_at,
+                observation.etag,
+                observation.last_modified,
+                observation.payload_hash,
+                observation.acquisition_source,
+                observation.requested_limit,
+                observation.actual_result_count,
+                observation.result_status.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("cannot replace Last.fm artist observation: {error}"))?;
+    connection
+        .execute(
+            "DELETE FROM artist_similarity_edges WHERE query_id = ?1",
+            [query_id],
+        )
+        .map_err(|error| format!("cannot replace Last.fm artist similarity edges: {error}"))?;
+    for edge in edges {
+        connection
+            .execute(
+                "INSERT INTO artist_similarity_edges(query_id, target_artist_id, rank, match_score) VALUES (?1, ?2, ?3, ?4)",
+                params![query_id, edge.target_artist_id, edge.rank, edge.match_score],
+            )
+            .map_err(|error| format!("cannot insert Last.fm artist similarity edge: {error}"))?;
+    }
+    Ok(())
+}
+
+fn replace_track_observation_on(
+    connection: &Connection,
+    source_track_id: i64,
+    observation: &ArtistObservationWrite,
+    edges: &[(i64, u32, Option<f64>)],
+) -> Result<(), String> {
+    let query_id: i64 = connection
+        .query_row(
+            r#"
+            INSERT INTO track_queries(
+                source_track_id, fetched_at, validated_at, changed_at,
+                expires_at, etag, last_modified, payload_hash,
+                acquisition_source, requested_limit, actual_result_count,
+                result_status
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            ON CONFLICT(source_track_id) DO UPDATE SET
+                fetched_at = excluded.fetched_at,
+                validated_at = excluded.validated_at,
+                changed_at = excluded.changed_at,
+                expires_at = excluded.expires_at,
+                etag = excluded.etag,
+                last_modified = excluded.last_modified,
+                payload_hash = excluded.payload_hash,
+                acquisition_source = excluded.acquisition_source,
+                requested_limit = excluded.requested_limit,
+                actual_result_count = excluded.actual_result_count,
+                result_status = excluded.result_status
+            RETURNING query_id
+            "#,
+            params![
+                source_track_id,
+                observation.fetched_at,
+                observation.validated_at,
+                observation.changed_at,
+                observation.expires_at,
+                observation.etag,
+                observation.last_modified,
+                observation.payload_hash,
+                observation.acquisition_source,
+                observation.requested_limit,
+                observation.actual_result_count,
+                observation.result_status.as_str(),
+            ],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("cannot replace Last.fm track observation: {error}"))?;
+    connection
+        .execute(
+            "DELETE FROM track_similarity_edges WHERE query_id = ?1",
+            [query_id],
+        )
+        .map_err(|error| format!("cannot replace Last.fm track similarity edges: {error}"))?;
+    for (target_track_id, rank, match_score) in edges {
+        connection
+            .execute(
+                "INSERT INTO track_similarity_edges(query_id, target_track_id, rank, match_score) VALUES (?1, ?2, ?3, ?4)",
+                params![query_id, target_track_id, rank, match_score],
+            )
+            .map_err(|error| format!("cannot insert Last.fm track similarity edge: {error}"))?;
+    }
+    Ok(())
 }
 
 fn normalized_mbid(value: Option<&str>) -> Option<String> {

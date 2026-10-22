@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "entries": {
+    "artist:seed artist": {
+      "fetched_at_unix_seconds": 1700000000,
+      "value": [
+        {
+          "name": "Related Artist",
+          "mbid": "related-artist-mbid",
+          "score": 0.9
+        }
+      ]
+    },
+    "artist:empty artist": {
+      "fetched_at_unix_seconds": 1700000100,
+      "value": []
+    },
+    "track:seed artist|seed song": {
+      "fetched_at_unix_seconds": 1700000200,
+      "value": [
+        {
+          "artist": "Related Artist",
+          "title": "Related Song",
+          "artist_mbid": "related-artist-mbid",
+          "recording_mbid": "related-recording-mbid",
+          "score": 0.8
+        }
+      ]
+    }
+  }
+}
