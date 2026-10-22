@@ -1,6 +1,11 @@
-use crate::cache::PersistentCache;
-use bliss_guidance_lastfm::lastfm_api::{
-    ArtistLimit, LastFmClient, LastFmError, SimilarArtist, SimilarTrack,
+use crate::freshness::{canonical_artist_payload_hash, expires_at, FreshnessClass};
+use crate::lastfm_api::{
+    ArtistLimit, LastFmClient, LastFmError, ResponseEnvelope, ResponseStatus, SimilarArtist,
+    SimilarTrack, Validators,
+};
+use crate::store::{
+    ArtistEdgeWrite, ArtistIdentity, ArtistObservationRecord, ArtistObservationWrite, GraphStore,
+    ObservationStatus, ObservationValidation, TrackIdentity, TrackObservationRecord,
 };
 use bliss_playlist_guidance_spi::{Anchor, Candidate, Diagnostics, ScoreContext};
 use serde_json::Value;
@@ -55,11 +60,27 @@ fn push_log_event(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirectOptions {
     pub api_endpoint: String,
-    pub cache_path: String,
-    pub cache_ttl_seconds: u64,
+    pub store_path: String,
+    pub legacy_cache_path: Option<String>,
+    pub retrieval_policy: RetrievalPolicy,
+    pub artist_result_limit: ArtistLimit,
+    pub storage_scope: StorageScope,
     pub request_deadline_ms: u64,
     pub max_concurrent_requests: usize,
     pub diagnostic_level: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetrievalPolicy {
+    OnlineWithCache,
+    OfflinePreferred,
+    OfflineOnly,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageScope {
+    AllReturnedArtists,
+    LocalArtistsOnly,
 }
 
 impl DirectOptions {
@@ -70,11 +91,11 @@ impl DirectOptions {
         if object.get("acquisition_mode").and_then(Value::as_str) != Some("direct") {
             return Err("direct Last.fm acquisition mode is required".to_owned());
         }
-        let cache_path = object
-            .get("cache_path")
+        let store_path = object
+            .get("store_path")
             .and_then(Value::as_str)
             .filter(|value| !value.is_empty())
-            .ok_or_else(|| "trusted Last.fm cache path is required".to_owned())?;
+            .ok_or_else(|| "trusted Last.fm graph path is required".to_owned())?;
         let api_endpoint = object
             .get("api_endpoint")
             .and_then(Value::as_str)
@@ -84,7 +105,35 @@ impl DirectOptions {
         if !(api_endpoint.starts_with("https://") || api_endpoint.starts_with("http://")) {
             return Err("trusted Last.fm endpoint is invalid".to_owned());
         }
-        let cache_ttl_seconds = integer_option(object, "cache_ttl_seconds", 1, 2_592_000)?;
+        let retrieval_policy = match object
+            .get("retrieval_policy")
+            .and_then(Value::as_str)
+            .unwrap_or("online_with_cache")
+        {
+            "online_with_cache" => RetrievalPolicy::OnlineWithCache,
+            "offline_preferred" => RetrievalPolicy::OfflinePreferred,
+            "offline_only" => RetrievalPolicy::OfflineOnly,
+            _ => return Err("direct Last.fm retrieval policy is invalid".to_owned()),
+        };
+        let artist_result_limit = match object
+            .get("artist_result_limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(25)
+        {
+            25 => ArtistLimit::TwentyFive,
+            50 => ArtistLimit::Fifty,
+            100 => ArtistLimit::OneHundred,
+            _ => return Err("direct Last.fm artist result limit is invalid".to_owned()),
+        };
+        let storage_scope = match object
+            .get("storage_scope")
+            .and_then(Value::as_str)
+            .unwrap_or("all_returned_artists")
+        {
+            "all_returned_artists" => StorageScope::AllReturnedArtists,
+            "local_artists_only" => StorageScope::LocalArtistsOnly,
+            _ => return Err("direct Last.fm storage scope is invalid".to_owned()),
+        };
         let request_deadline_ms = integer_option(object, "request_deadline_ms", 100, 60_000)?;
         let max_concurrent_requests = integer_option(object, "max_concurrent_requests", 1, 8)?;
         let diagnostic_level = object
@@ -95,8 +144,15 @@ impl DirectOptions {
             .to_owned();
         Ok(Self {
             api_endpoint,
-            cache_path: cache_path.to_owned(),
-            cache_ttl_seconds,
+            store_path: store_path.to_owned(),
+            legacy_cache_path: object
+                .get("legacy_cache_path")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            retrieval_policy,
+            artist_result_limit,
+            storage_scope,
             request_deadline_ms,
             max_concurrent_requests: max_concurrent_requests as usize,
             diagnostic_level,
@@ -130,22 +186,45 @@ struct DirectRelation {
 #[derive(Clone, Debug)]
 enum FetchTask {
     Track {
-        cache_key: String,
+        key: String,
+        source_id: i64,
         artist: String,
         title: String,
         recording_mbid: Option<String>,
+        existing: Option<TrackObservationRecord>,
     },
     Artist {
-        cache_key: String,
+        key: String,
+        source_id: i64,
         artist: String,
         artist_mbid: Option<String>,
+        existing: Option<ArtistObservationRecord>,
     },
 }
 
+#[derive(Clone, Debug)]
+enum FetchResponse {
+    Track(ResponseEnvelope<SimilarTrack>),
+    Artist(ResponseEnvelope<SimilarArtist>),
+}
+
 impl FetchTask {
-    fn cache_key(&self) -> &str {
+    fn key(&self) -> &str {
         match self {
-            Self::Track { cache_key, .. } | Self::Artist { cache_key, .. } => cache_key,
+            Self::Track { key, .. } | Self::Artist { key, .. } => key,
+        }
+    }
+
+    fn validators(&self) -> Option<Validators> {
+        match self {
+            Self::Track { existing, .. } => existing.as_ref().map(|value| Validators {
+                etag: value.etag.clone(),
+                last_modified: value.last_modified.clone(),
+            }),
+            Self::Artist { existing, .. } => existing.as_ref().map(|value| Validators {
+                etag: value.etag.clone(),
+                last_modified: value.last_modified.clone(),
+            }),
         }
     }
 
@@ -209,38 +288,40 @@ impl FetchTask {
         endpoint: &str,
         api_key: &str,
         deadline: Instant,
-    ) -> Result<Value, LastFmError> {
+        artist_limit: ArtistLimit,
+    ) -> Result<FetchResponse, LastFmError> {
         let timeout = remaining_duration(deadline)
             .map_err(|_| LastFmError::retryable("direct Last.fm prepare deadline exceeded"))?;
         let client = LastFmClient::new(endpoint, api_key, timeout)
             .map_err(|_| LastFmError::permanent("direct Last.fm configuration is invalid"))?;
-        let value = match self {
+        let validators = self.validators();
+        match self {
             Self::Track {
                 artist,
                 title,
                 recording_mbid,
                 ..
-            } => serde_json::to_value(
-                client
-                    .similar_tracks(artist, title, recording_mbid.as_deref(), None)?
-                    .results,
-            ),
+            } => client
+                .similar_tracks(
+                    artist,
+                    title,
+                    recording_mbid.as_deref(),
+                    validators.as_ref(),
+                )
+                .map(FetchResponse::Track),
             Self::Artist {
                 artist,
                 artist_mbid,
                 ..
-            } => serde_json::to_value(
-                client
-                    .similar_artists(
-                        artist,
-                        artist_mbid.as_deref(),
-                        ArtistLimit::TwentyFive,
-                        None,
-                    )?
-                    .results,
-            ),
-        };
-        value.map_err(|_| LastFmError::permanent("cannot encode direct Last.fm cache value"))
+            } => client
+                .similar_artists(
+                    artist,
+                    artist_mbid.as_deref(),
+                    artist_limit,
+                    validators.as_ref(),
+                )
+                .map(FetchResponse::Artist),
+        }
     }
 }
 
@@ -250,9 +331,12 @@ impl DirectPrepared {
         anchors: &[Anchor],
     ) -> Result<(Self, Diagnostics), String> {
         let api_key = options.api_key_from_environment()?;
-        let now = unix_seconds();
+        let now = unix_seconds() as i64;
         let deadline = Instant::now() + Duration::from_millis(options.request_deadline_ms);
-        let mut cache = PersistentCache::load(&options.cache_path, options.cache_ttl_seconds)?;
+        let mut store = GraphStore::open_at(&options.store_path, now)?;
+        if let Some(path) = options.legacy_cache_path.as_deref() {
+            let _ = crate::legacy_cache::migrate_legacy_cache(path, &mut store, now)?;
+        }
         let mut track_queries = BTreeMap::<String, (String, String, Option<String>)>::new();
         let mut artist_queries = BTreeMap::<String, (String, Option<String>)>::new();
         for anchor in anchors {
@@ -298,19 +382,45 @@ impl DirectPrepared {
         }
         let mut request_count = 0_u64;
         let mut cache_hits = 0_u64;
+        let mut stale_offline = 0_u64;
+        let mut missing = 0_u64;
+        let mut persistence_failed = 0_u64;
         let mut tracks = HashMap::<String, Vec<SimilarTrack>>::new();
         let mut misses = Vec::new();
         for (key, (artist, title, mbid)) in &track_queries {
-            let cache_key = format!("track:{key}");
+            let identity = TrackIdentity {
+                recording_mbid: mbid.clone(),
+                artist: ArtistIdentity {
+                    mbid: None,
+                    name: artist.clone(),
+                },
+                title: title.clone(),
+            };
+            let source_id = store.resolve_or_create_track(&identity, now)?;
+            let existing = store.track_observation(source_id)?;
             let task = FetchTask::Track {
-                cache_key,
+                key: key.clone(),
+                source_id,
                 artist: artist.clone(),
                 title: title.clone(),
                 recording_mbid: mbid.clone(),
+                existing: existing.clone(),
             };
-            if let Some(value) = cache.get(task.cache_key(), now) {
+            let fresh = existing
+                .as_ref()
+                .is_some_and(|value| value.expires_at > now);
+            let use_stored = fresh
+                || matches!(
+                    options.retrieval_policy,
+                    RetrievalPolicy::OfflinePreferred | RetrievalPolicy::OfflineOnly
+                ) && existing.is_some();
+            if use_stored {
                 cache_hits += 1;
-                let result_count = value.as_array().map(Vec::len).unwrap_or(0);
+                if !fresh {
+                    stale_offline += 1;
+                }
+                let value = stored_tracks(&store, existing.as_ref().unwrap())?;
+                let result_count = value.len();
                 if wants_info(&options.diagnostic_level) {
                     push_log_event(
                         &mut log_events,
@@ -318,7 +428,7 @@ impl DirectPrepared {
                         "lastfm_lookup_completed",
                         Some(task.operation()),
                         Some(task.source()),
-                        Some("hit"),
+                        Some(if fresh { "hit" } else { "stale_offline" }),
                         Some(result_count),
                         None,
                     );
@@ -335,9 +445,12 @@ impl DirectPrepared {
                         Some(serde_json::json!({"results": value})),
                     );
                 }
-                let decoded = serde_json::from_value(value)
-                    .map_err(|_| "cached Last.fm track relation is invalid".to_owned())?;
-                tracks.insert(key.clone(), decoded);
+                tracks.insert(key.clone(), value);
+                if !fresh && options.retrieval_policy == RetrievalPolicy::OfflinePreferred {
+                    misses.push(task);
+                }
+            } else if options.retrieval_policy == RetrievalPolicy::OfflineOnly {
+                missing += 1;
             } else {
                 if wants_info(&options.diagnostic_level) {
                     push_log_event(
@@ -368,15 +481,44 @@ impl DirectPrepared {
         }
         let mut artists = HashMap::<String, Vec<SimilarArtist>>::new();
         for (key, (artist, mbid)) in &artist_queries {
-            let cache_key = format!("artist:{key}");
+            let source_id = store.resolve_or_create_artist(
+                &ArtistIdentity {
+                    mbid: mbid.clone(),
+                    name: artist.clone(),
+                },
+                now,
+            )?;
+            let existing = store.artist_observation(source_id)?;
             let task = FetchTask::Artist {
-                cache_key,
+                key: key.clone(),
+                source_id,
                 artist: artist.clone(),
                 artist_mbid: mbid.clone(),
+                existing: existing.clone(),
             };
-            if let Some(value) = cache.get(task.cache_key(), now) {
+            let complete = existing
+                .as_ref()
+                .is_some_and(|value| value.requested_limit >= options.artist_result_limit.value());
+            let fresh = existing
+                .as_ref()
+                .is_some_and(|value| value.expires_at > now)
+                && complete;
+            let use_stored = fresh
+                || matches!(
+                    options.retrieval_policy,
+                    RetrievalPolicy::OfflinePreferred | RetrievalPolicy::OfflineOnly
+                ) && existing.is_some();
+            if use_stored {
                 cache_hits += 1;
-                let result_count = value.as_array().map(Vec::len).unwrap_or(0);
+                if !fresh {
+                    stale_offline += 1;
+                }
+                let value = stored_artists(
+                    &store,
+                    existing.as_ref().unwrap(),
+                    options.artist_result_limit.value(),
+                )?;
+                let result_count = value.len();
                 if wants_info(&options.diagnostic_level) {
                     push_log_event(
                         &mut log_events,
@@ -384,7 +526,7 @@ impl DirectPrepared {
                         "lastfm_lookup_completed",
                         Some(task.operation()),
                         Some(task.source()),
-                        Some("hit"),
+                        Some(if fresh { "hit" } else { "stale_offline" }),
                         Some(result_count),
                         None,
                     );
@@ -401,9 +543,12 @@ impl DirectPrepared {
                         Some(serde_json::json!({"results": value})),
                     );
                 }
-                let decoded = serde_json::from_value(value)
-                    .map_err(|_| "cached Last.fm artist relation is invalid".to_owned())?;
-                artists.insert(key.clone(), decoded);
+                artists.insert(key.clone(), value);
+                if !fresh && options.retrieval_policy == RetrievalPolicy::OfflinePreferred {
+                    misses.push(task);
+                }
+            } else if options.retrieval_policy == RetrievalPolicy::OfflineOnly {
+                missing += 1;
             } else {
                 if wants_info(&options.diagnostic_level) {
                     push_log_event(
@@ -440,9 +585,12 @@ impl DirectPrepared {
             failures,
         } = fetch_concurrently(options, &api_key, deadline, misses);
         request_count += batch_request_count;
-        for (task, value) in values {
-            let key = task.cache_key().to_owned();
-            let result_count = value.as_array().map(Vec::len).unwrap_or(0);
+        for (task, response) in values {
+            let key = task.key().to_owned();
+            let result_count = match &response {
+                FetchResponse::Track(value) => value.actual_result_count as usize,
+                FetchResponse::Artist(value) => value.actual_result_count as usize,
+            };
             if wants_info(&options.diagnostic_level) {
                 push_log_event(
                     &mut log_events,
@@ -456,6 +604,10 @@ impl DirectPrepared {
                 );
             }
             if wants_debug(&options.diagnostic_level) {
+                let debug_results = match &response {
+                    FetchResponse::Track(value) => serde_json::json!(value.results),
+                    FetchResponse::Artist(value) => serde_json::json!(value.results),
+                };
                 push_log_event(
                     &mut log_events,
                     "debug",
@@ -464,20 +616,30 @@ impl DirectPrepared {
                     Some(task.source()),
                     Some("miss"),
                     Some(result_count),
-                    Some(serde_json::json!({"results": value})),
+                    Some(serde_json::json!({"results": debug_results})),
                 );
             }
-            cache.put(key.clone(), value.clone(), now);
-            match task {
-                FetchTask::Track { .. } => {
-                    let decoded = serde_json::from_value(value)
-                        .map_err(|_| "cached Last.fm track relation is invalid".to_owned())?;
-                    tracks.insert(key.trim_start_matches("track:").to_owned(), decoded);
+            let persisted = persist_response(&mut store, &task, &response, now);
+            if persisted.is_err() {
+                persistence_failed += 1;
+            }
+            match response {
+                FetchResponse::Track(value) => {
+                    if value.status == ResponseStatus::Modified {
+                        tracks.insert(key, value.results);
+                    } else if let Some(existing) = task_track_observation(&task) {
+                        tracks.insert(key, stored_tracks(&store, existing)?);
+                    }
                 }
-                FetchTask::Artist { .. } => {
-                    let decoded = serde_json::from_value(value)
-                        .map_err(|_| "cached Last.fm artist relation is invalid".to_owned())?;
-                    artists.insert(key.trim_start_matches("artist:").to_owned(), decoded);
+                FetchResponse::Artist(value) => {
+                    if value.status == ResponseStatus::Modified {
+                        artists.insert(key, value.results);
+                    } else if let Some(existing) = task_artist_observation(&task) {
+                        artists.insert(
+                            key,
+                            stored_artists(&store, existing, options.artist_result_limit.value())?,
+                        );
+                    }
                 }
             }
         }
@@ -493,8 +655,6 @@ impl DirectPrepared {
                 Some(serde_json::json!({"error": error})),
             );
         }
-        cache.save()?;
-
         let mut relations_by_source = HashMap::new();
         for anchor in anchors {
             let mut relations = Vec::new();
@@ -540,10 +700,16 @@ impl DirectPrepared {
             .map(Vec::len)
             .sum::<usize>();
         let failure_count = prepared.failure_count;
-        let state = if failure_count == 0 {
+        let state = if persistence_failed > 0 {
+            "persistence_failed"
+        } else if failure_count == 0 && missing == 0 && stale_offline == 0 {
             "fresh"
+        } else if stale_offline > 0 {
+            "stale_offline"
+        } else if missing > 0 {
+            "missing"
         } else {
-            "degraded"
+            "partial"
         };
         if wants_info(&options.diagnostic_level) {
             push_log_event(
@@ -572,6 +738,11 @@ impl DirectPrepared {
                     "acquisition_mode": "direct", "cache_hits": cache_hits,
                     "source_anchors": anchors.len(), "relations": relation_count,
                     "failed_requests": failure_count,
+                    "fresh": request_count,
+                    "cached": cache_hits,
+                    "stale_offline": stale_offline,
+                    "missing": missing,
+                    "persistence_failed": persistence_failed,
                     "log_events_v1": log_events,
                 })),
             },
@@ -621,6 +792,256 @@ impl DirectPrepared {
     }
 }
 
+fn task_track_observation(task: &FetchTask) -> Option<&TrackObservationRecord> {
+    match task {
+        FetchTask::Track { existing, .. } => existing.as_ref(),
+        FetchTask::Artist { .. } => None,
+    }
+}
+
+fn task_artist_observation(task: &FetchTask) -> Option<&ArtistObservationRecord> {
+    match task {
+        FetchTask::Artist { existing, .. } => existing.as_ref(),
+        FetchTask::Track { .. } => None,
+    }
+}
+
+fn stored_artists(
+    store: &GraphStore,
+    observation: &ArtistObservationRecord,
+    limit: u32,
+) -> Result<Vec<SimilarArtist>, String> {
+    observation
+        .edges
+        .iter()
+        .take(limit as usize)
+        .map(|edge| {
+            let target = store
+                .artist(edge.target_artist_id)?
+                .ok_or_else(|| "Last.fm artist edge target is missing".to_owned())?;
+            Ok(SimilarArtist {
+                name: target.canonical_name,
+                mbid: target.mbid,
+                score: edge.match_score,
+            })
+        })
+        .collect()
+}
+
+fn stored_tracks(
+    store: &GraphStore,
+    observation: &TrackObservationRecord,
+) -> Result<Vec<SimilarTrack>, String> {
+    observation
+        .edges
+        .iter()
+        .map(|edge| {
+            let target = store
+                .track(edge.target_track_id)?
+                .ok_or_else(|| "Last.fm track edge target is missing".to_owned())?;
+            let artist = store
+                .artist(target.artist_id)?
+                .ok_or_else(|| "Last.fm track artist is missing".to_owned())?;
+            Ok(SimilarTrack {
+                artist: artist.canonical_name,
+                title: target.canonical_title,
+                artist_mbid: artist.mbid,
+                recording_mbid: target.recording_mbid,
+                score: edge.match_score,
+            })
+        })
+        .collect()
+}
+
+fn persist_response(
+    store: &mut GraphStore,
+    task: &FetchTask,
+    response: &FetchResponse,
+    now: i64,
+) -> Result<(), String> {
+    match (task, response) {
+        (
+            FetchTask::Artist {
+                source_id,
+                key,
+                existing,
+                ..
+            },
+            FetchResponse::Artist(response),
+        ) => {
+            let class = if response.results.is_empty() {
+                FreshnessClass::ArtistEmpty
+            } else {
+                FreshnessClass::ArtistPositive
+            };
+            let expiry = expires_at(
+                now,
+                response.headers.cache_control.as_deref(),
+                response.headers.expires.as_deref(),
+                class,
+            );
+            if response.status == ResponseStatus::NotModified {
+                return store.revalidate_artist_observation(
+                    *source_id,
+                    &validation(response, None, now, expiry),
+                );
+            }
+            let hash_rows = response
+                .results
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    (
+                        target.mbid.as_deref().unwrap_or(""),
+                        target.name.as_str(),
+                        index as u32 + 1,
+                        target.score,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let hash = canonical_artist_payload_hash("artist.getSimilar", key, &hash_rows);
+            if existing
+                .as_ref()
+                .is_some_and(|value| value.payload_hash == hash)
+            {
+                return store.revalidate_artist_observation(
+                    *source_id,
+                    &validation(response, Some(response.requested_limit), now, expiry),
+                );
+            }
+            let mut edges = Vec::with_capacity(response.results.len());
+            for (index, target) in response.results.iter().enumerate() {
+                let target_id = store.resolve_or_create_artist(
+                    &ArtistIdentity {
+                        mbid: target.mbid.clone(),
+                        name: target.name.clone(),
+                    },
+                    now,
+                )?;
+                edges.push(ArtistEdgeWrite {
+                    target_artist_id: target_id,
+                    rank: index as u32 + 1,
+                    match_score: target.score,
+                });
+            }
+            store.replace_artist_observation(
+                *source_id,
+                &observation_write(response, hash, now, expiry),
+                &edges,
+            )
+        }
+        (
+            FetchTask::Track {
+                source_id,
+                key,
+                existing,
+                ..
+            },
+            FetchResponse::Track(response),
+        ) => {
+            let expiry = expires_at(
+                now,
+                response.headers.cache_control.as_deref(),
+                response.headers.expires.as_deref(),
+                FreshnessClass::Track,
+            );
+            if response.status == ResponseStatus::NotModified {
+                return store.revalidate_track_observation(
+                    *source_id,
+                    &validation(response, None, now, expiry),
+                );
+            }
+            let hash_rows = response
+                .results
+                .iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    (
+                        target.recording_mbid.as_deref().unwrap_or(""),
+                        target.title.as_str(),
+                        index as u32 + 1,
+                        target.score,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let hash = canonical_artist_payload_hash("track.getSimilar", key, &hash_rows);
+            if existing
+                .as_ref()
+                .is_some_and(|value| value.payload_hash == hash)
+            {
+                return store.revalidate_track_observation(
+                    *source_id,
+                    &validation(response, Some(response.requested_limit), now, expiry),
+                );
+            }
+            let mut edges = Vec::with_capacity(response.results.len());
+            for (index, target) in response.results.iter().enumerate() {
+                let target_id = store.resolve_or_create_track(
+                    &TrackIdentity {
+                        recording_mbid: target.recording_mbid.clone(),
+                        artist: ArtistIdentity {
+                            mbid: target.artist_mbid.clone(),
+                            name: target.artist.clone(),
+                        },
+                        title: target.title.clone(),
+                    },
+                    now,
+                )?;
+                edges.push((target_id, index as u32 + 1, target.score));
+            }
+            store.replace_track_observation(
+                *source_id,
+                &observation_write(response, hash, now, expiry),
+                &edges,
+            )
+        }
+        _ => Err("Last.fm fetch task and response do not match".to_owned()),
+    }
+}
+
+fn validation<T>(
+    response: &ResponseEnvelope<T>,
+    requested_limit: Option<u32>,
+    now: i64,
+    expiry: i64,
+) -> ObservationValidation {
+    ObservationValidation {
+        fetched_at: (response.status == ResponseStatus::Modified).then_some(now),
+        validated_at: now,
+        expires_at: expiry,
+        etag: response.headers.etag.clone(),
+        last_modified: response.headers.last_modified.clone(),
+        requested_limit,
+        actual_result_count: (response.status == ResponseStatus::Modified)
+            .then_some(response.actual_result_count),
+    }
+}
+
+fn observation_write<T>(
+    response: &ResponseEnvelope<T>,
+    hash: String,
+    now: i64,
+    expiry: i64,
+) -> ArtistObservationWrite {
+    ArtistObservationWrite {
+        fetched_at: now,
+        validated_at: now,
+        changed_at: now,
+        expires_at: expiry,
+        etag: response.headers.etag.clone(),
+        last_modified: response.headers.last_modified.clone(),
+        payload_hash: hash,
+        acquisition_source: "api_key".to_owned(),
+        requested_limit: response.requested_limit,
+        actual_result_count: response.actual_result_count,
+        result_status: if response.actual_result_count == 0 {
+            ObservationStatus::Empty
+        } else {
+            ObservationStatus::Positive
+        },
+    }
+}
+
 impl DirectRelation {
     fn matches(&self, candidate: &Candidate) -> bool {
         match (&self.track, &self.artist) {
@@ -650,7 +1071,7 @@ impl DirectRelation {
 }
 
 struct FetchBatch {
-    values: Vec<(FetchTask, Value)>,
+    values: Vec<(FetchTask, FetchResponse)>,
     request_count: u64,
     failure_count: u64,
     failures: Vec<(FetchTask, String)>,
@@ -690,7 +1111,14 @@ fn fetch_concurrently(
                     .expect("direct queue lock poisoned")
                     .pop_front();
                 let Some(task) = task else { break };
-                match fetch_with_retry(&task, &endpoint, api_key, deadline, &request_count) {
+                match fetch_with_retry(
+                    &task,
+                    &endpoint,
+                    api_key,
+                    deadline,
+                    options.artist_result_limit,
+                    &request_count,
+                ) {
                     Ok(value) => results
                         .lock()
                         .expect("direct result lock poisoned")
@@ -707,9 +1135,9 @@ fn fetch_concurrently(
         }
     });
     let mut results = std::mem::take(&mut *results.lock().expect("direct result lock poisoned"));
-    results.sort_unstable_by(|left, right| left.0.cache_key().cmp(right.0.cache_key()));
+    results.sort_unstable_by(|left, right| left.0.key().cmp(right.0.key()));
     let mut failures = std::mem::take(&mut *failures.lock().expect("direct failure lock poisoned"));
-    failures.sort_unstable_by(|left, right| left.0.cache_key().cmp(right.0.cache_key()));
+    failures.sort_unstable_by(|left, right| left.0.key().cmp(right.0.key()));
     FetchBatch {
         values: results,
         request_count: request_count.load(Ordering::Relaxed),
@@ -730,11 +1158,12 @@ fn fetch_with_retry(
     endpoint: &str,
     api_key: &str,
     deadline: Instant,
+    artist_limit: ArtistLimit,
     request_count: &AtomicU64,
-) -> Result<Value, String> {
+) -> Result<FetchResponse, String> {
     for attempt in 0..=MAX_TRANSIENT_RETRIES {
         request_count.fetch_add(1, Ordering::Relaxed);
-        match task.fetch(endpoint, api_key, deadline) {
+        match task.fetch(endpoint, api_key, deadline, artist_limit) {
             Ok(value) => return Ok(value),
             Err(error) if error.is_retryable() && attempt < MAX_TRANSIENT_RETRIES => {
                 let delay = Duration::from_millis(RETRY_BACKOFF_MILLIS * u64::from(attempt + 1));

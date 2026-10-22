@@ -558,6 +558,22 @@ impl GraphStore {
             .map_err(|error| format!("cannot commit Last.fm artist observation: {error}"))
     }
 
+    pub fn replace_track_observation(
+        &mut self,
+        source_track_id: i64,
+        observation: &ArtistObservationWrite,
+        edges: &[(i64, u32, Option<f64>)],
+    ) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| format!("cannot start Last.fm graph transaction: {error}"))?;
+        replace_track_observation_on(&transaction, source_track_id, observation, edges)?;
+        transaction
+            .commit()
+            .map_err(|error| format!("cannot commit Last.fm track observation: {error}"))
+    }
+
     pub fn revalidate_artist_observation(
         &mut self,
         source_artist_id: i64,

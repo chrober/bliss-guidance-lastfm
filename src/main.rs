@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-mod cache;
-mod direct;
-
+use bliss_guidance_lastfm::direct;
 use bliss_playlist_guidance_spi::policy::HostPolicyKind;
 use bliss_playlist_guidance_spi::{
     encode, ArtifactDescriptor, Candidate, Capability, ChannelDescriptor, Diagnostics,
@@ -117,8 +115,11 @@ impl Provider {
                 "type": "object",
                 "properties": {
                     "acquisition_mode": {"enum": ["artifact", "direct"]},
-                    "cache_path": {"type": "string"},
-                    "cache_ttl_seconds": {"type": "integer", "minimum": 1, "maximum": 2592000},
+                    "store_path": {"type": "string"},
+                    "legacy_cache_path": {"type": "string"},
+                    "retrieval_policy": {"enum": ["online_with_cache", "offline_preferred", "offline_only"]},
+                    "artist_result_limit": {"enum": [25, 50, 100]},
+                    "storage_scope": {"enum": ["all_returned_artists", "local_artists_only"]},
                     "request_deadline_ms": {"type": "integer", "minimum": 100, "maximum": 60000},
                     "max_concurrent_requests": {"type": "integer", "minimum": 1, "maximum": 8},
                     "api_endpoint": {"type": "string"},
@@ -714,7 +715,8 @@ mod tests {
             .and_then(serde_json::Value::as_object)
             .unwrap();
         assert!(properties.contains_key("acquisition_mode"));
-        assert!(properties.contains_key("cache_path"));
+        assert!(properties.contains_key("store_path"));
+        assert!(properties.contains_key("retrieval_policy"));
         assert!(properties.contains_key("max_concurrent_requests"));
         assert!(!properties.contains_key("api_key"));
     }
@@ -1111,59 +1113,14 @@ mod tests {
         let _api_key_environment = api_key_environment_lock();
         let options = serde_json::json!({
             "acquisition_mode": "direct",
-            "cache_path": "/trusted/cache/lastfm-v1.json",
-            "cache_ttl_seconds": 3600,
+            "store_path": "/trusted/cache/lastfm-guidance.sqlite",
             "request_deadline_ms": 5000,
             "max_concurrent_requests": 2
         });
         let parsed = crate::direct::DirectOptions::from_prepare_options(&options).unwrap();
-        assert_eq!(parsed.cache_ttl_seconds, 3600);
+        assert_eq!(parsed.artist_result_limit.value(), 25);
         assert!(parsed.api_key_from_environment().is_err());
         assert!(!serde_json::to_string(&options).unwrap().contains("api_key"));
-    }
-
-    #[test]
-    fn direct_cache_keeps_fresh_values_and_expires_old_values() {
-        let path = fixture_path();
-        let mut cache = crate::cache::PersistentCache::load(&path, 60).unwrap();
-        cache.put(
-            "artist:seed",
-            serde_json::json!({"artists": ["related"]}),
-            100,
-        );
-        cache.save().unwrap();
-
-        let cache = crate::cache::PersistentCache::load(&path, 60).unwrap();
-        assert_eq!(
-            cache.get("artist:seed", 159),
-            Some(serde_json::json!({"artists": ["related"]}))
-        );
-        assert_eq!(cache.get("artist:seed", 160), None);
-        let _ = fs::remove_file(path);
-    }
-
-    #[test]
-    fn direct_cache_merges_entries_written_by_overlapping_provider_sessions() {
-        let path = fixture_path();
-        let mut first = crate::cache::PersistentCache::load(&path, 60).unwrap();
-        let mut second = crate::cache::PersistentCache::load(&path, 60).unwrap();
-        first.put("artist:first", serde_json::json!(["one"]), 100);
-        second.put("artist:second", serde_json::json!(["two"]), 101);
-
-        first.save().unwrap();
-        second.save().unwrap();
-
-        let merged = crate::cache::PersistentCache::load(&path, 60).unwrap();
-        assert_eq!(
-            merged.get("artist:first", 101),
-            Some(serde_json::json!(["one"]))
-        );
-        assert_eq!(
-            merged.get("artist:second", 101),
-            Some(serde_json::json!(["two"]))
-        );
-        let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(path.with_extension("lock"));
     }
 
     #[test]
@@ -1260,7 +1217,7 @@ mod tests {
         std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
         let options = serde_json::json!({
             "acquisition_mode": "direct", "api_endpoint": endpoint,
-            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "store_path": cache_path,
             "request_deadline_ms": 5000, "max_concurrent_requests": 2,
             "diagnostic_level": "debug",
         });
@@ -1385,7 +1342,7 @@ mod tests {
         std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
         let options = serde_json::json!({
             "acquisition_mode": "direct", "api_endpoint": endpoint,
-            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "store_path": cache_path,
             "request_deadline_ms": 5000, "max_concurrent_requests": 2,
         });
         let anchors = ["one", "two"]
@@ -1458,7 +1415,7 @@ mod tests {
         std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
         let options = serde_json::json!({
             "acquisition_mode": "direct", "api_endpoint": endpoint,
-            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "store_path": cache_path,
             "request_deadline_ms": 5000, "max_concurrent_requests": 1,
         });
         let anchors = vec![bliss_playlist_guidance_spi::Anchor {
@@ -1492,7 +1449,7 @@ mod tests {
         std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, "test-api-key");
         let options = serde_json::json!({
             "acquisition_mode": "direct", "api_endpoint": endpoint,
-            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "store_path": cache_path,
             "request_deadline_ms": 1000, "max_concurrent_requests": 2,
         });
         let anchors = vec![bliss_playlist_guidance_spi::Anchor {
@@ -1511,7 +1468,7 @@ mod tests {
 
         let mut provider = Provider::default();
         let (_, diagnostics) = provider.prepare_direct(&options, &anchors).unwrap();
-        assert_eq!(diagnostics.state.as_deref(), Some("degraded"));
+        assert_eq!(diagnostics.state.as_deref(), Some("partial"));
         assert_eq!(diagnostics.failure_count, 2);
         std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
         let _ = fs::remove_file(cache_path);
@@ -1528,7 +1485,7 @@ mod tests {
         std::env::set_var(crate::direct::API_KEY_ENVIRONMENT, secret);
         let options = serde_json::json!({
             "acquisition_mode": "direct", "api_endpoint": endpoint,
-            "cache_path": cache_path, "cache_ttl_seconds": 3600,
+            "store_path": cache_path,
             "request_deadline_ms": 1000, "max_concurrent_requests": 1,
         });
         let anchors = vec![bliss_playlist_guidance_spi::Anchor {
@@ -1547,7 +1504,7 @@ mod tests {
 
         let mut provider = Provider::default();
         let (snapshot_id, diagnostics) = provider.prepare_direct(&options, &anchors).unwrap();
-        let cache = std::fs::read_to_string(&cache_path).unwrap_or_default();
+        let cache = std::fs::read(&cache_path).unwrap_or_default();
         let serialized = serde_json::to_string(&serde_json::json!({
             "options": options,
             "snapshot_id": snapshot_id,
@@ -1555,7 +1512,9 @@ mod tests {
         }))
         .unwrap();
         assert!(!serialized.contains(secret));
-        assert!(!cache.contains(secret));
+        assert!(!cache
+            .windows(secret.len())
+            .any(|window| window == secret.as_bytes()));
         std::env::remove_var(crate::direct::API_KEY_ENVIRONMENT);
         let _ = fs::remove_file(cache_path);
     }
