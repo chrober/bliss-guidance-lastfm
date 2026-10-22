@@ -105,6 +105,9 @@ pub fn initialize(connection: &Connection, created_at: i64) -> Result<(), String
             CREATE UNIQUE INDEX IF NOT EXISTS tracks_recording_mbid_unique
                 ON tracks(recording_mbid)
                 WHERE recording_mbid IS NOT NULL AND recording_mbid != '';
+            CREATE UNIQUE INDEX IF NOT EXISTS tracks_name_only_unique
+                ON tracks(artist_id, normalized_title)
+                WHERE recording_mbid IS NULL;
             CREATE INDEX IF NOT EXISTS tracks_normalized_title
                 ON tracks(normalized_title);
 

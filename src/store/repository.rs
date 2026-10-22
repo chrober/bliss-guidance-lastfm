@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use super::schema;
-use rusqlite::{params, Connection, OptionalExtension};
+use super::{normalize_name, ArtistIdentity, TrackIdentity};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +76,23 @@ pub struct ArtistObservationRecord {
     pub edges: Vec<ArtistEdgeRecord>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtistRecord {
+    pub artist_id: i64,
+    pub mbid: Option<String>,
+    pub canonical_name: String,
+    pub normalized_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackRecord {
+    pub track_id: i64,
+    pub recording_mbid: Option<String>,
+    pub artist_id: i64,
+    pub canonical_title: String,
+    pub normalized_title: String,
+}
+
 #[derive(Debug)]
 pub struct GraphStore {
     connection: Connection,
@@ -136,23 +155,60 @@ impl GraphStore {
         canonical_name: &str,
         now: i64,
     ) -> Result<i64, String> {
-        let mbid = artist_mbid
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_ascii_lowercase);
-        let name = canonical_name.trim();
+        self.resolve_or_create_artist(
+            &ArtistIdentity {
+                mbid: artist_mbid.map(str::to_owned),
+                name: canonical_name.to_owned(),
+            },
+            now,
+        )
+    }
+
+    pub fn resolve_or_create_artist(
+        &self,
+        identity: &ArtistIdentity,
+        now: i64,
+    ) -> Result<i64, String> {
+        let mbid = normalized_mbid(identity.mbid.as_deref());
+        let name = identity.name.trim();
         if name.is_empty() {
             return Err("Last.fm graph artist name is empty".to_owned());
         }
-        let normalized = normalize(name);
+        let normalized = normalize_name(name);
         let existing = if let Some(mbid) = mbid.as_deref() {
-            self.connection
+            let by_mbid = self
+                .connection
                 .query_row(
                     "SELECT artist_id FROM artists WHERE artist_mbid = ?1",
                     [mbid],
                     |row| row.get(0),
                 )
                 .optional()
+                .map_err(|error| format!("cannot resolve Last.fm graph artist MBID: {error}"))?;
+            if by_mbid.is_some() {
+                by_mbid
+            } else {
+                let name_only = self
+                    .connection
+                    .query_row(
+                        "SELECT artist_id FROM artists WHERE artist_mbid IS NULL AND normalized_name = ?1",
+                        [&normalized],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("cannot resolve Last.fm name-only artist: {error}"))?;
+                if let Some(artist_id) = name_only {
+                    self.connection
+                        .execute(
+                            "UPDATE artists SET artist_mbid = ?1 WHERE artist_id = ?2",
+                            params![mbid, artist_id],
+                        )
+                        .map_err(|error| {
+                            format!("cannot promote Last.fm graph artist identity: {error}")
+                        })?;
+                }
+                name_only
+            }
         } else {
             self.connection
                 .query_row(
@@ -161,8 +217,8 @@ impl GraphStore {
                     |row| row.get(0),
                 )
                 .optional()
-        }
-        .map_err(|error| format!("cannot resolve Last.fm graph artist: {error}"))?;
+                .map_err(|error| format!("cannot resolve Last.fm graph artist: {error}"))?
+        };
         let artist_id = if let Some(artist_id) = existing {
             self.connection
                 .execute(
@@ -187,6 +243,206 @@ impl GraphStore {
             )
             .map_err(|error| format!("cannot insert Last.fm graph artist alias: {error}"))?;
         Ok(artist_id)
+    }
+
+    pub fn artist(&self, artist_id: i64) -> Result<Option<ArtistRecord>, String> {
+        self.connection
+            .query_row(
+                "SELECT artist_mbid, canonical_name, normalized_name FROM artists WHERE artist_id = ?1",
+                [artist_id],
+                |row| {
+                    Ok(ArtistRecord {
+                        artist_id,
+                        mbid: row.get(0)?,
+                        canonical_name: row.get(1)?,
+                        normalized_name: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read Last.fm graph artist: {error}"))
+    }
+
+    pub fn find_artist(&self, identity: &ArtistIdentity) -> Result<Option<i64>, String> {
+        Ok(self.find_artists(std::slice::from_ref(identity))?.remove(0))
+    }
+
+    pub fn find_artists(&self, identities: &[ArtistIdentity]) -> Result<Vec<Option<i64>>, String> {
+        if identities.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut mbids = identities
+            .iter()
+            .filter_map(|identity| normalized_mbid(identity.mbid.as_deref()))
+            .collect::<Vec<_>>();
+        mbids.sort_unstable();
+        mbids.dedup();
+        let mut names = identities
+            .iter()
+            .map(|identity| normalize_name(&identity.name))
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+
+        let mbid_placeholders = std::iter::repeat_n("?", mbids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let name_placeholders = std::iter::repeat_n("?", names.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let mbid_clause = if mbids.is_empty() {
+            String::new()
+        } else {
+            format!("artist_mbid IN ({mbid_placeholders}) OR ")
+        };
+        let sql = format!(
+            "SELECT artist_id, artist_mbid, normalized_name FROM artists WHERE {mbid_clause}normalized_name IN ({name_placeholders})"
+        );
+        let parameters = mbids
+            .iter()
+            .chain(names.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut statement = self
+            .connection
+            .prepare(&sql)
+            .map_err(|error| format!("cannot prepare batched Last.fm artist lookup: {error}"))?;
+        let rows = statement
+            .query_map(params_from_iter(parameters), |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|error| format!("cannot query batched Last.fm artists: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("cannot decode batched Last.fm artist: {error}"))?;
+        let mut by_mbid = HashMap::new();
+        let mut by_name = HashMap::<String, Vec<(i64, Option<String>)>>::new();
+        for (artist_id, mbid, normalized_name) in rows {
+            if let Some(mbid) = mbid.as_deref() {
+                by_mbid.insert(mbid.to_owned(), artist_id);
+            }
+            by_name
+                .entry(normalized_name)
+                .or_default()
+                .push((artist_id, mbid));
+        }
+        Ok(identities
+            .iter()
+            .map(|identity| {
+                let mbid = normalized_mbid(identity.mbid.as_deref());
+                if let Some(artist_id) = mbid.as_ref().and_then(|value| by_mbid.get(value)) {
+                    return Some(*artist_id);
+                }
+                let candidates = by_name.get(&normalize_name(&identity.name))?;
+                if mbid.is_some() {
+                    let name_only = candidates
+                        .iter()
+                        .filter(|(_, candidate_mbid)| candidate_mbid.is_none())
+                        .collect::<Vec<_>>();
+                    (name_only.len() == 1).then_some(name_only[0].0)
+                } else {
+                    (candidates.len() == 1).then_some(candidates[0].0)
+                }
+            })
+            .collect())
+    }
+
+    pub fn resolve_or_create_track(
+        &self,
+        identity: &TrackIdentity,
+        now: i64,
+    ) -> Result<i64, String> {
+        let artist_id = self.resolve_or_create_artist(&identity.artist, now)?;
+        let recording_mbid = normalized_mbid(identity.recording_mbid.as_deref());
+        let title = identity.title.trim();
+        if title.is_empty() {
+            return Err("Last.fm graph track title is empty".to_owned());
+        }
+        let normalized_title = normalize_name(title);
+        let existing = if let Some(mbid) = recording_mbid.as_deref() {
+            let by_mbid = self
+                .connection
+                .query_row(
+                    "SELECT track_id FROM tracks WHERE recording_mbid = ?1",
+                    [mbid],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| format!("cannot resolve Last.fm graph recording MBID: {error}"))?;
+            if by_mbid.is_some() {
+                by_mbid
+            } else {
+                let name_only = self
+                    .connection
+                    .query_row(
+                        "SELECT track_id FROM tracks WHERE recording_mbid IS NULL AND artist_id = ?1 AND normalized_title = ?2",
+                        params![artist_id, normalized_title],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(|error| format!("cannot resolve Last.fm name-only track: {error}"))?;
+                if let Some(track_id) = name_only {
+                    self.connection
+                        .execute(
+                            "UPDATE tracks SET recording_mbid = ?1 WHERE track_id = ?2",
+                            params![mbid, track_id],
+                        )
+                        .map_err(|error| {
+                            format!("cannot promote Last.fm graph recording identity: {error}")
+                        })?;
+                }
+                name_only
+            }
+        } else {
+            self.connection
+                .query_row(
+                    "SELECT track_id FROM tracks WHERE recording_mbid IS NULL AND artist_id = ?1 AND normalized_title = ?2",
+                    params![artist_id, normalized_title],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(|error| format!("cannot resolve Last.fm graph track: {error}"))?
+        };
+        let track_id = if let Some(track_id) = existing {
+            self.connection
+                .execute(
+                    "UPDATE tracks SET artist_id = ?1, canonical_title = ?2, normalized_title = ?3 WHERE track_id = ?4",
+                    params![artist_id, title, normalized_title, track_id],
+                )
+                .map_err(|error| format!("cannot update Last.fm graph track: {error}"))?;
+            track_id
+        } else {
+            self.connection
+                .execute(
+                    "INSERT INTO tracks(recording_mbid, artist_id, canonical_title, normalized_title) VALUES (?1, ?2, ?3, ?4)",
+                    params![recording_mbid, artist_id, title, normalized_title],
+                )
+                .map_err(|error| format!("cannot insert Last.fm graph track: {error}"))?;
+            self.connection.last_insert_rowid()
+        };
+        Ok(track_id)
+    }
+
+    pub fn track(&self, track_id: i64) -> Result<Option<TrackRecord>, String> {
+        self.connection
+            .query_row(
+                "SELECT recording_mbid, artist_id, canonical_title, normalized_title FROM tracks WHERE track_id = ?1",
+                [track_id],
+                |row| {
+                    Ok(TrackRecord {
+                        track_id,
+                        recording_mbid: row.get(0)?,
+                        artist_id: row.get(1)?,
+                        canonical_title: row.get(2)?,
+                        normalized_title: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|error| format!("cannot read Last.fm graph track: {error}"))
     }
 
     pub fn replace_artist_observation(
@@ -343,8 +599,11 @@ impl GraphStore {
     }
 }
 
-fn normalize(value: &str) -> String {
-    value.trim().to_lowercase()
+fn normalized_mbid(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 fn unix_seconds() -> i64 {
