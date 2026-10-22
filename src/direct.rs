@@ -999,6 +999,29 @@ fn persist_response(
     }
 }
 
+pub(crate) fn persist_artist_response(
+    store: &mut GraphStore,
+    source: &ArtistIdentity,
+    response: &ResponseEnvelope<SimilarArtist>,
+    now: i64,
+) -> Result<bool, String> {
+    let source_id = store.resolve_or_create_artist(source, now)?;
+    let existing = store.artist_observation(source_id)?;
+    let old_hash = existing.as_ref().map(|value| value.payload_hash.clone());
+    let task = FetchTask::Artist {
+        key: artist_key(&source.name, source.mbid.as_deref()),
+        source_id,
+        artist: source.name.clone(),
+        artist_mbid: source.mbid.clone(),
+        existing,
+    };
+    persist_response(store, &task, &FetchResponse::Artist(response.clone()), now)?;
+    let new_hash = store
+        .artist_observation(source_id)?
+        .map(|value| value.payload_hash);
+    Ok(old_hash != new_hash)
+}
+
 fn validation<T>(
     response: &ResponseEnvelope<T>,
     requested_limit: Option<u32>,

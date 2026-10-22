@@ -24,7 +24,7 @@ fn version_metadata_json() -> String {
 }
 
 fn usage() -> &'static str {
-    "Usage:\n  bliss-guidance-lastfm version [--json]\n  bliss-guidance-lastfm"
+    "Usage:\n  bliss-guidance-lastfm version [--json]\n  bliss-guidance-lastfm graph <status|sync|compact|delete> --request <path>\n  bliss-guidance-lastfm"
 }
 
 #[derive(Debug, Deserialize)]
@@ -562,6 +562,29 @@ fn main() {
         }
         [command, format] if command == "version" && format == "--json" => {
             println!("{}", version_metadata_json());
+            return;
+        }
+        [graph, command, request_flag, request_path]
+            if graph == "graph" && request_flag == "--request" =>
+        {
+            let mut stdout = io::BufWriter::new(io::stdout().lock());
+            if let Err(error) = bliss_guidance_lastfm::maintenance::run_graph_command(
+                command,
+                std::path::Path::new(request_path),
+                &mut stdout,
+            ) {
+                let _ = writeln!(
+                    stdout,
+                    "{}",
+                    serde_json::json!({
+                        "schema_version": 1,
+                        "state": "failed",
+                        "error": error,
+                    })
+                );
+                let _ = stdout.flush();
+                std::process::exit(1);
+            }
             return;
         }
         _ => {

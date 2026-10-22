@@ -4,4 +4,7 @@ pub mod direct;
 pub mod freshness;
 pub mod lastfm_api;
 pub mod legacy_cache;
+pub mod maintenance;
+pub mod progress;
+pub mod root_snapshot;
 pub mod store;

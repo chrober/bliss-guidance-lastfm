@@ -167,6 +167,16 @@ pub struct GraphStore {
     connection: Connection,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GraphStatistics {
+    pub artists: u64,
+    pub artist_observations: u64,
+    pub artist_edges: u64,
+    pub tracks: u64,
+    pub track_observations: u64,
+    pub track_edges: u64,
+}
+
 impl GraphStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         Self::open_at(path, unix_seconds())
@@ -216,6 +226,67 @@ impl GraphStore {
             .optional()
             .map(|value| value.is_some())
             .map_err(|error| format!("cannot inspect Last.fm graph schema: {error}"))
+    }
+
+    pub fn statistics(&self) -> Result<GraphStatistics, String> {
+        Ok(GraphStatistics {
+            artists: self.count("artists")?,
+            artist_observations: self.count("artist_queries")?,
+            artist_edges: self.count("artist_similarity_edges")?,
+            tracks: self.count("tracks")?,
+            track_observations: self.count("track_queries")?,
+            track_edges: self.count("track_similarity_edges")?,
+        })
+    }
+
+    fn count(&self, table: &str) -> Result<u64, String> {
+        self.connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|value| value.max(0) as u64)
+            .map_err(|error| format!("cannot count Last.fm graph {table}: {error}"))
+    }
+
+    pub fn replace_library_membership(
+        &mut self,
+        snapshot_id: &str,
+        library_identity: &str,
+        created_at: i64,
+        artist_ids: &[i64],
+    ) -> Result<(), String> {
+        let transaction = self.connection.transaction().map_err(|error| {
+            format!("cannot start Last.fm library-membership transaction: {error}")
+        })?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO library_snapshots(snapshot_id, library_identity, created_at) VALUES (?1, ?2, ?3)",
+                params![snapshot_id, library_identity, created_at],
+            )
+            .map_err(|error| format!("cannot store Last.fm library snapshot: {error}"))?;
+        transaction
+            .execute(
+                "DELETE FROM library_artist_membership WHERE snapshot_id = ?1",
+                [snapshot_id],
+            )
+            .map_err(|error| format!("cannot replace Last.fm library membership: {error}"))?;
+        for artist_id in artist_ids {
+            transaction
+                .execute(
+                    "INSERT INTO library_artist_membership(snapshot_id, artist_id) VALUES (?1, ?2)",
+                    params![snapshot_id, artist_id],
+                )
+                .map_err(|error| format!("cannot store Last.fm library artist: {error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("cannot commit Last.fm library membership: {error}"))
+    }
+
+    pub fn checkpoint_and_compact(&mut self) -> Result<(), String> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
+            .map_err(|error| format!("cannot compact Last.fm graph: {error}"))
     }
 
     pub fn upsert_artist(

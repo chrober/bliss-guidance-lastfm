@@ -1,0 +1,13 @@
+{
+  "kind": "lastfm-library-artist-roots-v1",
+  "snapshot_id": "fixture-snapshot",
+  "library_identity": "fixture-library",
+  "generated_at": 1700000000,
+  "artists": [
+    {
+      "lms_contributor_id": 1,
+      "name": "Seed Artist",
+      "artist_mbids": ["seed-artist-mbid"]
+    }
+  ]
+}
