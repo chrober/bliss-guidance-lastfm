@@ -8,6 +8,6 @@ pub use identity::{normalize_name, ArtistIdentity, TrackIdentity};
 pub use repository::{
     ArtistEdgeRecord, ArtistEdgeWrite, ArtistObservationRecord, ArtistObservationWrite,
     ArtistRecord, GraphStore, LegacyArtistObservation, LegacyArtistTarget, LegacyGraphImport,
-    LegacyTrackObservation, LegacyTrackTarget, ObservationStatus, TrackEdgeRecord,
-    TrackObservationRecord, TrackRecord,
+    LegacyTrackObservation, LegacyTrackTarget, ObservationStatus, ObservationValidation,
+    TrackEdgeRecord, TrackObservationRecord, TrackRecord,
 };

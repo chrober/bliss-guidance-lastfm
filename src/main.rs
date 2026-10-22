@@ -2,7 +2,6 @@
 
 mod cache;
 mod direct;
-mod lastfm_api;
 
 use bliss_playlist_guidance_spi::policy::HostPolicyKind;
 use bliss_playlist_guidance_spi::{
@@ -1175,7 +1174,7 @@ mod tests {
                 "artist": {"name": "Related Artist", "mbid": "artist-mbid-2"}
             }]}
         });
-        let tracks = crate::lastfm_api::parse_similar_tracks(&payload).unwrap();
+        let tracks = bliss_guidance_lastfm::lastfm_api::parse_similar_tracks(&payload).unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(
             tracks[0].recording_mbid.as_deref(),
@@ -1188,12 +1187,16 @@ mod tests {
     #[test]
     fn direct_lastfm_parser_negative_caches_unknown_tracks_and_artists() {
         let not_found = serde_json::json!({"error": 6, "message": "not found"});
-        assert!(crate::lastfm_api::parse_similar_tracks(&not_found)
-            .unwrap()
-            .is_empty());
-        assert!(crate::lastfm_api::parse_similar_artists(&not_found)
-            .unwrap()
-            .is_empty());
+        assert!(
+            bliss_guidance_lastfm::lastfm_api::parse_similar_tracks(&not_found)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            bliss_guidance_lastfm::lastfm_api::parse_similar_artists(&not_found)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1216,13 +1219,16 @@ mod tests {
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
         });
 
-        let client =
-            crate::lastfm_api::LastFmClient::new(&endpoint, "test-api-key", Duration::from_secs(2))
-                .unwrap();
+        let client = bliss_guidance_lastfm::lastfm_api::LastFmClient::new(
+            &endpoint,
+            "test-api-key",
+            Duration::from_secs(2),
+        )
+        .unwrap();
         let tracks = client
-            .similar_tracks("Seed Artist", "Seed Song", Some("recording-mbid-1"))
+            .similar_tracks("Seed Artist", "Seed Song", Some("recording-mbid-1"), None)
             .unwrap();
-        assert_eq!(tracks[0].title, "Related Song");
+        assert_eq!(tracks.results[0].title, "Related Song");
         server.join().unwrap();
     }
 

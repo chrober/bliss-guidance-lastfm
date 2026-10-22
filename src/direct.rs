@@ -1,5 +1,7 @@
 use crate::cache::PersistentCache;
-use crate::lastfm_api::{LastFmClient, LastFmError, SimilarArtist, SimilarTrack};
+use bliss_guidance_lastfm::lastfm_api::{
+    ArtistLimit, LastFmClient, LastFmError, SimilarArtist, SimilarTrack,
+};
 use bliss_playlist_guidance_spi::{Anchor, Candidate, Diagnostics, ScoreContext};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -218,16 +220,25 @@ impl FetchTask {
                 title,
                 recording_mbid,
                 ..
-            } => serde_json::to_value(client.similar_tracks(
-                artist,
-                title,
-                recording_mbid.as_deref(),
-            )?),
+            } => serde_json::to_value(
+                client
+                    .similar_tracks(artist, title, recording_mbid.as_deref(), None)?
+                    .results,
+            ),
             Self::Artist {
                 artist,
                 artist_mbid,
                 ..
-            } => serde_json::to_value(client.similar_artists(artist, artist_mbid.as_deref())?),
+            } => serde_json::to_value(
+                client
+                    .similar_artists(
+                        artist,
+                        artist_mbid.as_deref(),
+                        ArtistLimit::TwentyFive,
+                        None,
+                    )?
+                    .results,
+            ),
         };
         value.map_err(|_| LastFmError::permanent("cannot encode direct Last.fm cache value"))
     }

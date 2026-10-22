@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 bliss-playlist-guidance-spi = { git = "https://github.com/chrober/bliss-playlist-guidance-spi.git", rev = "3eb3af8" }
 fs2 = "0.4"
+httpdate = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

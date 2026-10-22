@@ -45,6 +45,17 @@ pub struct ArtistObservationWrite {
     pub result_status: ObservationStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservationValidation {
+    pub fetched_at: Option<i64>,
+    pub validated_at: i64,
+    pub expires_at: i64,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub requested_limit: Option<u32>,
+    pub actual_result_count: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ArtistEdgeWrite {
     pub target_artist_id: i64,
@@ -545,6 +556,80 @@ impl GraphStore {
         transaction
             .commit()
             .map_err(|error| format!("cannot commit Last.fm artist observation: {error}"))
+    }
+
+    pub fn revalidate_artist_observation(
+        &mut self,
+        source_artist_id: i64,
+        validation: &ObservationValidation,
+    ) -> Result<(), String> {
+        let changed = self
+            .connection
+            .execute(
+                r#"
+                UPDATE artist_queries SET
+                    fetched_at = COALESCE(?2, fetched_at),
+                    validated_at = ?3,
+                    expires_at = ?4,
+                    etag = COALESCE(?5, etag),
+                    last_modified = COALESCE(?6, last_modified),
+                    requested_limit = COALESCE(?7, requested_limit),
+                    actual_result_count = COALESCE(?8, actual_result_count)
+                WHERE source_artist_id = ?1
+                "#,
+                params![
+                    source_artist_id,
+                    validation.fetched_at,
+                    validation.validated_at,
+                    validation.expires_at,
+                    validation.etag,
+                    validation.last_modified,
+                    validation.requested_limit,
+                    validation.actual_result_count,
+                ],
+            )
+            .map_err(|error| format!("cannot revalidate Last.fm artist observation: {error}"))?;
+        if changed == 0 {
+            return Err("cannot revalidate missing Last.fm artist observation".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn revalidate_track_observation(
+        &mut self,
+        source_track_id: i64,
+        validation: &ObservationValidation,
+    ) -> Result<(), String> {
+        let changed = self
+            .connection
+            .execute(
+                r#"
+                UPDATE track_queries SET
+                    fetched_at = COALESCE(?2, fetched_at),
+                    validated_at = ?3,
+                    expires_at = ?4,
+                    etag = COALESCE(?5, etag),
+                    last_modified = COALESCE(?6, last_modified),
+                    requested_limit = COALESCE(?7, requested_limit),
+                    actual_result_count = COALESCE(?8, actual_result_count)
+                WHERE source_track_id = ?1
+                "#,
+                params![
+                    source_track_id,
+                    validation.fetched_at,
+                    validation.validated_at,
+                    validation.expires_at,
+                    validation.etag,
+                    validation.last_modified,
+                    validation.requested_limit,
+                    validation.actual_result_count,
+                ],
+            )
+            .map_err(|error| format!("cannot revalidate Last.fm track observation: {error}"))?;
+        if changed == 0 {
+            return Err("cannot revalidate missing Last.fm track observation".to_owned());
+        }
+        Ok(())
     }
 
     pub fn artist_observation(

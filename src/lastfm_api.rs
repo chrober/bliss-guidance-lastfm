@@ -2,6 +2,52 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArtistLimit {
+    TwentyFive,
+    Fifty,
+    OneHundred,
+}
+
+impl ArtistLimit {
+    pub fn value(self) -> u32 {
+        match self {
+            Self::TwentyFive => 25,
+            Self::Fifty => 50,
+            Self::OneHundred => 100,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Validators {
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResponseHeaders {
+    pub cache_control: Option<String>,
+    pub expires: Option<String>,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseStatus {
+    Modified,
+    NotModified,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResponseEnvelope<T> {
+    pub status: ResponseStatus,
+    pub results: Vec<T>,
+    pub requested_limit: u32,
+    pub actual_result_count: u32,
+    pub headers: ResponseHeaders,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LastFmError {
     message: &'static str,
@@ -9,14 +55,14 @@ pub struct LastFmError {
 }
 
 impl LastFmError {
-    pub(crate) fn retryable(message: &'static str) -> Self {
+    pub fn retryable(message: &'static str) -> Self {
         Self {
             message,
             retryable: true,
         }
     }
 
-    pub(crate) fn permanent(message: &'static str) -> Self {
+    pub fn permanent(message: &'static str) -> Self {
         Self {
             message,
             retryable: false,
@@ -76,7 +122,8 @@ impl LastFmClient {
         artist: &str,
         title: &str,
         recording_mbid: Option<&str>,
-    ) -> Result<Vec<SimilarTrack>, LastFmError> {
+        validators: Option<&Validators>,
+    ) -> Result<ResponseEnvelope<SimilarTrack>, LastFmError> {
         let mut request = self
             .base_request("track.getSimilar")
             .query("artist", artist)
@@ -86,25 +133,26 @@ impl LastFmClient {
         if let Some(mbid) = recording_mbid.filter(|value| !value.is_empty()) {
             request = request.query("mbid", mbid);
         }
-        parse_similar_tracks(&self.call(request)?)
-            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))
+        self.parse_response(request, 25, validators, parse_similar_tracks)
     }
 
     pub fn similar_artists(
         &self,
         artist: &str,
         artist_mbid: Option<&str>,
-    ) -> Result<Vec<SimilarArtist>, LastFmError> {
+        limit: ArtistLimit,
+        validators: Option<&Validators>,
+    ) -> Result<ResponseEnvelope<SimilarArtist>, LastFmError> {
+        let requested_limit = limit.value();
         let mut request = self
             .base_request("artist.getSimilar")
             .query("artist", artist)
             .query("autocorrect", "1")
-            .query("limit", "25");
+            .query("limit", &requested_limit.to_string());
         if let Some(mbid) = artist_mbid.filter(|value| !value.is_empty()) {
             request = request.query("mbid", mbid);
         }
-        parse_similar_artists(&self.call(request)?)
-            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))
+        self.parse_response(request, requested_limit, validators, parse_similar_artists)
     }
 
     fn base_request(&self, method: &str) -> ureq::Request {
@@ -115,9 +163,30 @@ impl LastFmClient {
             .query("format", "json")
     }
 
-    fn call(&self, request: ureq::Request) -> Result<Value, LastFmError> {
+    fn parse_response<T>(
+        &self,
+        mut request: ureq::Request,
+        requested_limit: u32,
+        validators: Option<&Validators>,
+        parser: fn(&Value) -> Result<Vec<T>, String>,
+    ) -> Result<ResponseEnvelope<T>, LastFmError> {
+        if let Some(value) = validators.and_then(|value| value.etag.as_deref()) {
+            request = request.set("If-None-Match", value);
+        }
+        if let Some(value) = validators.and_then(|value| value.last_modified.as_deref()) {
+            request = request.set("If-Modified-Since", value);
+        }
         let response = match request.call() {
             Ok(response) => response,
+            Err(ureq::Error::Status(304, response)) => {
+                return Ok(ResponseEnvelope {
+                    status: ResponseStatus::NotModified,
+                    results: Vec::new(),
+                    requested_limit,
+                    actual_result_count: 0,
+                    headers: response_headers(&response),
+                });
+            }
             Err(ureq::Error::Status(status, _)) if status == 429 || status >= 500 => {
                 return Err(LastFmError::retryable(
                     "direct Last.fm request is temporarily unavailable",
@@ -132,8 +201,36 @@ impl LastFmClient {
                 return Err(LastFmError::retryable("direct Last.fm request failed"));
             }
         };
-        serde_json::from_reader(response.into_reader())
-            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))
+        if response.status() == 304 {
+            return Ok(ResponseEnvelope {
+                status: ResponseStatus::NotModified,
+                results: Vec::new(),
+                requested_limit,
+                actual_result_count: 0,
+                headers: response_headers(&response),
+            });
+        }
+        let headers = response_headers(&response);
+        let payload: Value = serde_json::from_reader(response.into_reader())
+            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))?;
+        let results = parser(&payload)
+            .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))?;
+        Ok(ResponseEnvelope {
+            status: ResponseStatus::Modified,
+            actual_result_count: results.len() as u32,
+            results,
+            requested_limit,
+            headers,
+        })
+    }
+}
+
+fn response_headers(response: &ureq::Response) -> ResponseHeaders {
+    ResponseHeaders {
+        cache_control: response.header("Cache-Control").map(str::to_owned),
+        expires: response.header("Expires").map(str::to_owned),
+        etag: response.header("ETag").map(str::to_owned),
+        last_modified: response.header("Last-Modified").map(str::to_owned),
     }
 }
 
