@@ -6,7 +6,8 @@ Current hosts use two acquisition modes. **Artifact mode** consumes a frozen,
 resolved `semantic-evidence-v1` artifact prepared by trusted host code (for
 example through LastMix). **Direct mode** obtains relations once during
 `prepare`, using an API key inherited only through the process environment,
-then freezes them in a versioned local TTL cache. Both modes return the same
+then persists them in a versioned provider-owned SQLite graph and freezes the
+relations needed by that job. Both modes return the same
 bounded `lastfm_track` and `lastfm_artist` guidance; `score` never performs
 network I/O.
 
@@ -25,7 +26,8 @@ flowchart LR
     L[LastMix adapter] --> E[Resolved LastMix artifact]
     E -->|artifact prepare| P[bliss-guidance-lastfm]
     K[API key in child environment] -->|direct prepare| P
-    F[(Last.fm API and persistent cache)] -->|direct prepare only| P
+    F[(Last.fm API)] -->|direct prepare only| P
+    G[(lastfm-guidance.sqlite)] <-->|read-through and maintenance| P
     A[Route anchors\ntrack IDs and metadata] -->|prepare| P
     H -->|bounded candidates and context| P
     P -->|GuidanceSignal and diagnostics| H
@@ -46,8 +48,8 @@ the API key through the child process environment only.
 During artifact-mode `prepare`, the add-on reads the artifact once and builds
 an index of `source entity -> local candidate ID -> channel -> strongest
 support`. During direct-mode `prepare`, it resolves the requested anchor
-relations from its persistent cache or bounded HTTP requests and builds the
-same in-memory shape. It also
+relations from the SQLite graph or bounded HTTP requests, transactionally
+persists complete responses, and builds the same in-memory shape. It also
 uses the supplied local anchors to build `track anchor ID -> Last.fm artist
 source ID(s)`: it joins an anchor's artist MBID to an artist edge's MBID first,
 then uses a normalized artist-name fallback only when no MBID relation exists.
@@ -92,16 +94,47 @@ track or artist support. In particular, the provider never calculates a target
 share multiplier or ranks candidates itself.
 
 Direct mode accepts only trusted launch configuration: `acquisition_mode`,
-cache path/TTL, deadline, bounded request concurrency, and (where a test or a
-trusted host needs it) the Last.fm endpoint. Its API key is read solely from
+provider-owned store and legacy-migration paths, retrieval policy, persistence
+scope, result limit, deadline, bounded request concurrency, and (where a test
+or trusted host needs it) the Last.fm endpoint. Its API key is read solely from
 `BLISS_GUIDANCE_LASTFM_API_KEY`; it is never included in options, requests,
-artifacts, cache entries, diagnostics, or errors. Cache misses are fetched by a
+artifacts, SQLite rows, diagnostics, or errors. Misses and eligible
+revalidations are fetched by a
 bounded worker pool (at most `max_concurrent_requests`), and transient `429`,
 `5xx`, and transport failures receive two short deadline-bounded retries.
 Successful empty relations are cached like any other result. When requests
 remain unavailable, `prepare` succeeds in a redacted `degraded` state with
 neutral guidance for those sources, so the host can continue with Bliss-only
 selection.
+
+## Offline artist graph maintenance
+
+The Lyrion provider can launch the API-key-only maintenance interface with a
+trusted request file:
+
+```text
+bliss-guidance-lastfm graph status  --request request.json
+bliss-guidance-lastfm graph sync    --request request.json
+bliss-guidance-lastfm graph compact --request request.json
+bliss-guidance-lastfm graph delete  --request request.json
+```
+
+`sync` consumes a frozen `lastfm-library-artist-roots-v1` snapshot containing
+Lyrion contributor IDs, names, and available Artist MBIDs. It skips sufficient
+fresh observations, limits network traffic to one worker and at most one call
+per second, persists each complete response, and emits
+`lastfm_graph_progress_v1` JSONL. Cancellation, rate limiting, and the 80 MB
+operating budget leave already committed roots resumable. `compact` trims
+stored artist edges to the current result limit and optional local-library
+scope before checkpointing SQLite. `delete` requires explicit confirmation.
+
+The maintenance and graph paths are unreachable in artifact/LastMix mode.
+That mode neither opens nor reports the SQLite graph.
+
+The native `offline_only` retrieval policy is available for controlled testing.
+The Lyrion provider does not expose it as a supported user option while the
+applicable Last.fm terms remain unresolved; its public choices are online
+read-through and offline-preferred fallback.
 
 SPI v2 prepare input:
 
