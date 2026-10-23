@@ -619,7 +619,8 @@ impl DirectPrepared {
                     Some(serde_json::json!({"results": debug_results})),
                 );
             }
-            let persisted = persist_response(&mut store, &task, &response, now);
+            let persisted =
+                persist_response(&mut store, &task, &response, now, options.storage_scope);
             if persisted.is_err() {
                 persistence_failed += 1;
             }
@@ -858,6 +859,7 @@ fn persist_response(
     task: &FetchTask,
     response: &FetchResponse,
     now: i64,
+    storage_scope: StorageScope,
 ) -> Result<(), String> {
     match (task, response) {
         (
@@ -911,13 +913,24 @@ fn persist_response(
             }
             let mut edges = Vec::with_capacity(response.results.len());
             for (index, target) in response.results.iter().enumerate() {
-                let target_id = store.resolve_or_create_artist(
-                    &ArtistIdentity {
-                        mbid: target.mbid.clone(),
-                        name: target.name.clone(),
-                    },
-                    now,
-                )?;
+                let identity = ArtistIdentity {
+                    mbid: target.mbid.clone(),
+                    name: target.name.clone(),
+                };
+                let target_id = match storage_scope {
+                    StorageScope::AllReturnedArtists => {
+                        store.resolve_or_create_artist(&identity, now)?
+                    }
+                    StorageScope::LocalArtistsOnly => {
+                        let Some(target_id) = store.find_artist(&identity)? else {
+                            continue;
+                        };
+                        if !store.is_library_artist(target_id)? {
+                            continue;
+                        }
+                        target_id
+                    }
+                };
                 edges.push(ArtistEdgeWrite {
                     target_artist_id: target_id,
                     rank: index as u32 + 1,
@@ -1004,6 +1017,7 @@ pub(crate) fn persist_artist_response(
     source: &ArtistIdentity,
     response: &ResponseEnvelope<SimilarArtist>,
     now: i64,
+    storage_scope: StorageScope,
 ) -> Result<bool, String> {
     let source_id = store.resolve_or_create_artist(source, now)?;
     let existing = store.artist_observation(source_id)?;
@@ -1015,7 +1029,13 @@ pub(crate) fn persist_artist_response(
         artist_mbid: source.mbid.clone(),
         existing,
     };
-    persist_response(store, &task, &FetchResponse::Artist(response.clone()), now)?;
+    persist_response(
+        store,
+        &task,
+        &FetchResponse::Artist(response.clone()),
+        now,
+        storage_scope,
+    )?;
     let new_hash = store
         .artist_observation(source_id)?
         .map(|value| value.payload_hash);

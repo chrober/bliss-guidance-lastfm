@@ -159,6 +159,21 @@ fn throttling_and_transport_failures_are_retryable() {
     assert!(error.is_retryable());
     server.join().unwrap();
 
+    let body = r#"{"error":29,"message":"Rate limit exceeded"}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let leaked: &'static str = Box::leak(response.into_boxed_str());
+    let (endpoint, server) = serve_once(leaked);
+    let client = LastFmClient::new(&endpoint, "test-key", Duration::from_secs(2)).unwrap();
+    let error = client
+        .similar_artists("Source", None, ArtistLimit::TwentyFive, None)
+        .unwrap_err();
+    assert!(error.is_retryable());
+    assert_eq!(error.message(), "direct Last.fm request was rate limited");
+    server.join().unwrap();
+
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = format!("http://{}/2.0/", listener.local_addr().unwrap());
     drop(listener);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
-use crate::direct::{persist_artist_response, API_KEY_ENVIRONMENT};
-use crate::lastfm_api::{ArtistLimit, LastFmClient};
+use crate::direct::{persist_artist_response, StorageScope, API_KEY_ENVIRONMENT};
+use crate::lastfm_api::{ArtistLimit, LastFmClient, Validators};
 use crate::progress::GraphProgress;
 use crate::root_snapshot::LibraryArtistSnapshot;
 use crate::store::{ArtistIdentity, GraphStore};
@@ -17,12 +17,14 @@ const DEFAULT_BUDGET_BYTES: u64 = 80 * 1024 * 1024;
 pub struct GraphRequest {
     pub acquisition_mode: Option<String>,
     pub store_path: String,
+    pub legacy_cache_path: Option<String>,
     pub roots_path: Option<String>,
     pub api_endpoint: Option<String>,
     pub artist_result_limit: Option<u32>,
     pub cancel_path: Option<String>,
     pub confirmed: Option<bool>,
     pub budget_bytes: Option<u64>,
+    pub storage_scope: Option<String>,
 }
 
 impl GraphRequest {
@@ -49,6 +51,18 @@ impl GraphRequest {
             50 => Ok(ArtistLimit::Fifty),
             100 => Ok(ArtistLimit::OneHundred),
             _ => Err("Last.fm graph artist result limit is invalid".to_owned()),
+        }
+    }
+
+    fn storage_scope(&self) -> Result<StorageScope, String> {
+        match self
+            .storage_scope
+            .as_deref()
+            .unwrap_or("all_returned_artists")
+        {
+            "all_returned_artists" => Ok(StorageScope::AllReturnedArtists),
+            "local_artists_only" => Ok(StorageScope::LocalArtistsOnly),
+            _ => Err("Last.fm graph storage scope is invalid".to_owned()),
         }
     }
 }
@@ -89,6 +103,10 @@ fn status(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
             "tracks": statistics.tracks,
             "track_observations": statistics.track_observations,
             "track_edges": statistics.track_edges,
+            "library_artists": statistics.library_artists,
+            "covered_library_artists": statistics.covered_library_artists,
+            "external_artists": statistics.external_artists,
+            "reciprocal_artist_pairs": statistics.reciprocal_artist_pairs,
         }),
     )
 }
@@ -105,6 +123,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         .as_deref()
         .unwrap_or("https://ws.audioscrobbler.com/2.0/");
     let limit = request.artist_limit()?;
+    let storage_scope = request.storage_scope()?;
     let now = unix_seconds();
     let mut store = GraphStore::open_at(&request.store_path, now)?;
     let mut artist_ids = Vec::with_capacity(snapshot.artists.len());
@@ -155,19 +174,82 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         } else {
             if total_storage_bytes(request) >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
             {
-                return Err("Last.fm graph storage budget is exhausted".to_owned());
+                progress.budget_exhausted = true;
+                progress.finished = true;
+                progress.message = "Last.fm graph storage budget is exhausted".to_owned();
+                emit_json(output, &progress)?;
+                return Ok(());
             }
-            let response = client
-                .similar_artists(
+            let validators = stored.as_ref().map(|value| Validators {
+                etag: value.etag.clone(),
+                last_modified: value.last_modified.clone(),
+            });
+            let mut attempt = 0_u32;
+            let response = loop {
+                progress.requests += 1;
+                match client.similar_artists(
                     &root.name,
                     root.artist_mbids.first().map(String::as_str),
                     limit,
-                    None,
-                )
-                .map_err(|error| error.message().to_owned())?;
-            progress.requests += 1;
-            if persist_artist_response(&mut store, &identity, &response, unix_seconds())? {
+                    validators.as_ref(),
+                ) {
+                    Ok(response) => break response,
+                    Err(error) if error.is_retryable() && attempt < 2 => {
+                        let delay = 1_u64 << attempt;
+                        if error
+                            .retry_after_seconds()
+                            .is_some_and(|value| value > delay)
+                        {
+                            progress.failures += 1;
+                            progress.paused = true;
+                            progress.finished = true;
+                            progress.retry_at = Some(
+                                unix_seconds() + error.retry_after_seconds().unwrap_or(60) as i64,
+                            );
+                            progress.message =
+                                "Last.fm graph update paused after rate limiting".to_owned();
+                            emit_json(output, &progress)?;
+                            return Ok(());
+                        }
+                        std::thread::sleep(Duration::from_secs(delay));
+                        attempt += 1;
+                    }
+                    Err(error) if error.is_retryable() => {
+                        progress.failures += 1;
+                        progress.paused = true;
+                        progress.finished = true;
+                        progress.retry_at =
+                            Some(unix_seconds() + error.retry_after_seconds().unwrap_or(60) as i64);
+                        progress.message =
+                            "Last.fm graph update paused after a temporary request failure"
+                                .to_owned();
+                        emit_json(output, &progress)?;
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        progress.failures += 1;
+                        return Err(error.message().to_owned());
+                    }
+                }
+            };
+            if persist_artist_response(
+                &mut store,
+                &identity,
+                &response,
+                unix_seconds(),
+                storage_scope,
+            )? {
                 progress.changed += 1;
+            }
+            if total_storage_bytes(request) >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
+            {
+                progress.budget_exhausted = true;
+                progress.finished = true;
+                progress.database_bytes = database_bytes(&request.store_path);
+                progress.message =
+                    "Last.fm graph storage budget was reached after the current artist".to_owned();
+                emit_json(output, &progress)?;
+                return Ok(());
             }
             if index + 1 < snapshot.artists.len() {
                 std::thread::sleep(Duration::from_secs(1));
@@ -186,10 +268,18 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
 fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     request.require_api_key()?;
     let mut store = GraphStore::open(&request.store_path)?;
-    store.checkpoint_and_compact()?;
+    let limit = request.artist_limit()?.value();
+    let local_only = request.storage_scope()? == StorageScope::LocalArtistsOnly;
+    store.checkpoint_and_compact(limit, local_only)?;
+    let statistics = store.statistics()?;
     emit_json(
         output,
-        &json!({"schema_version":1,"state":"compacted","database_bytes":database_bytes(&request.store_path)}),
+        &json!({
+            "schema_version":1,
+            "state":"compacted",
+            "database_bytes":database_bytes(&request.store_path),
+            "artist_edges":statistics.artist_edges,
+        }),
     )
 }
 
@@ -201,6 +291,12 @@ fn delete(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
         if path.exists() {
             std::fs::remove_file(&path)
                 .map_err(|error| format!("cannot delete Last.fm graph file: {error}"))?;
+        }
+    }
+    if let Some(path) = request.legacy_cache_path.as_deref().map(PathBuf::from) {
+        if path.exists() {
+            std::fs::remove_file(&path)
+                .map_err(|error| format!("cannot delete legacy Last.fm cache: {error}"))?;
         }
     }
     emit_json(output, &json!({"schema_version":1,"state":"deleted"}))
@@ -232,6 +328,11 @@ fn database_bytes(store_path: &str) -> u64 {
 
 fn total_storage_bytes(request: &GraphRequest) -> u64 {
     database_bytes(&request.store_path)
+        + request
+            .legacy_cache_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok().map(|value| value.len()))
+            .unwrap_or(0)
 }
 
 fn unix_seconds() -> i64 {

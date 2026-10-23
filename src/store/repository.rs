@@ -175,6 +175,10 @@ pub struct GraphStatistics {
     pub tracks: u64,
     pub track_observations: u64,
     pub track_edges: u64,
+    pub library_artists: u64,
+    pub covered_library_artists: u64,
+    pub external_artists: u64,
+    pub reciprocal_artist_pairs: u64,
 }
 
 impl GraphStore {
@@ -229,6 +233,7 @@ impl GraphStore {
     }
 
     pub fn statistics(&self) -> Result<GraphStatistics, String> {
+        let current_snapshot = "(SELECT snapshot_id FROM library_snapshots ORDER BY created_at DESC, snapshot_id DESC LIMIT 1)";
         Ok(GraphStatistics {
             artists: self.count("artists")?,
             artist_observations: self.count("artist_queries")?,
@@ -236,7 +241,26 @@ impl GraphStore {
             tracks: self.count("tracks")?,
             track_observations: self.count("track_queries")?,
             track_edges: self.count("track_similarity_edges")?,
+            library_artists: self.scalar_count(&format!(
+                "SELECT COUNT(*) FROM library_artist_membership WHERE snapshot_id = {current_snapshot}"
+            ))?,
+            covered_library_artists: self.scalar_count(&format!(
+                "SELECT COUNT(*) FROM artist_queries WHERE source_artist_id IN (SELECT artist_id FROM library_artist_membership WHERE snapshot_id = {current_snapshot})"
+            ))?,
+            external_artists: self.scalar_count(&format!(
+                "SELECT COUNT(*) FROM artists WHERE artist_id NOT IN (SELECT artist_id FROM library_artist_membership WHERE snapshot_id = {current_snapshot})"
+            ))?,
+            reciprocal_artist_pairs: self.scalar_count(
+                "SELECT COUNT(*) FROM artist_similarity_edges first_edge JOIN artist_queries first_query ON first_query.query_id = first_edge.query_id JOIN artist_queries reverse_query ON reverse_query.source_artist_id = first_edge.target_artist_id JOIN artist_similarity_edges reverse_edge ON reverse_edge.query_id = reverse_query.query_id AND reverse_edge.target_artist_id = first_query.source_artist_id WHERE first_query.source_artist_id < reverse_query.source_artist_id",
+            )?,
         })
+    }
+
+    fn scalar_count(&self, sql: &str) -> Result<u64, String> {
+        self.connection
+            .query_row(sql, [], |row| row.get::<_, i64>(0))
+            .map(|value| value.max(0) as u64)
+            .map_err(|error| format!("cannot query Last.fm graph statistics: {error}"))
     }
 
     fn count(&self, table: &str) -> Result<u64, String> {
@@ -283,7 +307,31 @@ impl GraphStore {
             .map_err(|error| format!("cannot commit Last.fm library membership: {error}"))
     }
 
-    pub fn checkpoint_and_compact(&mut self) -> Result<(), String> {
+    pub fn checkpoint_and_compact(
+        &mut self,
+        artist_result_limit: u32,
+        local_artists_only: bool,
+    ) -> Result<(), String> {
+        let transaction = self.connection.transaction().map_err(|error| {
+            format!("cannot start Last.fm graph compaction transaction: {error}")
+        })?;
+        transaction
+            .execute(
+                "DELETE FROM artist_similarity_edges WHERE rank > ?1",
+                [artist_result_limit],
+            )
+            .map_err(|error| format!("cannot trim Last.fm artist edges: {error}"))?;
+        if local_artists_only {
+            transaction
+                .execute(
+                    "DELETE FROM artist_similarity_edges WHERE target_artist_id NOT IN (SELECT artist_id FROM library_artist_membership WHERE snapshot_id = (SELECT snapshot_id FROM library_snapshots ORDER BY created_at DESC, snapshot_id DESC LIMIT 1))",
+                    [],
+                )
+                .map_err(|error| format!("cannot trim non-library Last.fm artist edges: {error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("cannot commit Last.fm graph compaction: {error}"))?;
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
             .map_err(|error| format!("cannot compact Last.fm graph: {error}"))
@@ -405,6 +453,18 @@ impl GraphStore {
 
     pub fn find_artist(&self, identity: &ArtistIdentity) -> Result<Option<i64>, String> {
         Ok(self.find_artists(std::slice::from_ref(identity))?.remove(0))
+    }
+
+    pub fn is_library_artist(&self, artist_id: i64) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM library_artist_membership WHERE snapshot_id = (SELECT snapshot_id FROM library_snapshots ORDER BY created_at DESC, snapshot_id DESC LIMIT 1) AND artist_id = ?1 LIMIT 1",
+                [artist_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|value| value.is_some())
+            .map_err(|error| format!("cannot inspect Last.fm library membership: {error}"))
     }
 
     pub fn find_artists(&self, identities: &[ArtistIdentity]) -> Result<Vec<Option<i64>>, String> {

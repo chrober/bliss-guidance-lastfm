@@ -52,6 +52,7 @@ pub struct ResponseEnvelope<T> {
 pub struct LastFmError {
     message: &'static str,
     retryable: bool,
+    retry_after_seconds: Option<u64>,
 }
 
 impl LastFmError {
@@ -59,6 +60,7 @@ impl LastFmError {
         Self {
             message,
             retryable: true,
+            retry_after_seconds: None,
         }
     }
 
@@ -66,6 +68,15 @@ impl LastFmError {
         Self {
             message,
             retryable: false,
+            retry_after_seconds: None,
+        }
+    }
+
+    fn rate_limited(retry_after_seconds: Option<u64>) -> Self {
+        Self {
+            message: "direct Last.fm request was rate limited",
+            retryable: true,
+            retry_after_seconds,
         }
     }
 
@@ -75,6 +86,10 @@ impl LastFmError {
 
     pub fn message(&self) -> &'static str {
         self.message
+    }
+
+    pub fn retry_after_seconds(&self) -> Option<u64> {
+        self.retry_after_seconds
     }
 }
 
@@ -187,7 +202,10 @@ impl LastFmClient {
                     headers: response_headers(&response),
                 });
             }
-            Err(ureq::Error::Status(status, _)) if status == 429 || status >= 500 => {
+            Err(ureq::Error::Status(429, response)) => {
+                return Err(LastFmError::rate_limited(retry_after_seconds(&response)));
+            }
+            Err(ureq::Error::Status(status, _)) if status >= 500 => {
                 return Err(LastFmError::retryable(
                     "direct Last.fm request is temporarily unavailable",
                 ));
@@ -213,6 +231,16 @@ impl LastFmClient {
         let headers = response_headers(&response);
         let payload: Value = serde_json::from_reader(response.into_reader())
             .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))?;
+        if let Some(code) = lastfm_error_code(&payload) {
+            if code == 29 {
+                return Err(LastFmError::rate_limited(None));
+            }
+            if code != 6 {
+                return Err(LastFmError::permanent(
+                    "direct Last.fm request was rejected",
+                ));
+            }
+        }
         let results = parser(&payload)
             .map_err(|_| LastFmError::permanent("direct Last.fm response is invalid"))?;
         Ok(ResponseEnvelope {
@@ -223,6 +251,18 @@ impl LastFmClient {
             headers,
         })
     }
+}
+
+fn retry_after_seconds(response: &ureq::Response) -> Option<u64> {
+    response
+        .header("Retry-After")
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn lastfm_error_code(payload: &Value) -> Option<u64> {
+    payload
+        .get("error")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
 }
 
 fn response_headers(response: &ureq::Response) -> ResponseHeaders {
@@ -297,8 +337,5 @@ fn optional_score(value: Option<&Value>) -> Option<f64> {
 }
 
 fn is_not_found(payload: &Value) -> bool {
-    payload
-        .get("error")
-        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
-        == Some(6)
+    lastfm_error_code(payload) == Some(6)
 }

@@ -160,3 +160,65 @@ fn rolls_back_observation_and_edges_when_replacement_fails() {
     drop(store);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn reports_whether_an_artist_belongs_to_the_latest_library_snapshot() {
+    let path = database_path("membership");
+    let mut store = GraphStore::open(&path).unwrap();
+    let member = store.upsert_artist(None, "Member", 1_700_000_000).unwrap();
+    let outsider = store
+        .upsert_artist(None, "Outsider", 1_700_000_000)
+        .unwrap();
+    store
+        .replace_library_membership("snapshot-1", "library-1", 1_700_000_000, &[member])
+        .unwrap();
+    store
+        .replace_library_membership("snapshot-2", "library-2", 1_700_000_001, &[outsider])
+        .unwrap();
+
+    assert!(!store.is_library_artist(member).unwrap());
+    assert!(store.is_library_artist(outsider).unwrap());
+
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn compaction_applies_the_current_result_limit_and_local_artist_scope() {
+    let path = database_path("compact-scope");
+    let mut store = GraphStore::open(&path).unwrap();
+    let source = store.upsert_artist(None, "Source", 1_700_000_000).unwrap();
+    let member = store.upsert_artist(None, "Member", 1_700_000_000).unwrap();
+    let outsider = store
+        .upsert_artist(None, "Outsider", 1_700_000_000)
+        .unwrap();
+    store
+        .replace_library_membership("snapshot-1", "library-1", 1_700_000_000, &[source, member])
+        .unwrap();
+    store
+        .replace_artist_observation(
+            source,
+            &observation("compact-hash", ObservationStatus::Positive),
+            &[
+                ArtistEdgeWrite {
+                    target_artist_id: member,
+                    rank: 1,
+                    match_score: Some(0.9),
+                },
+                ArtistEdgeWrite {
+                    target_artist_id: outsider,
+                    rank: 2,
+                    match_score: Some(0.8),
+                },
+            ],
+        )
+        .unwrap();
+
+    store.checkpoint_and_compact(25, true).unwrap();
+    let stored = store.artist_observation(source).unwrap().unwrap();
+    assert_eq!(stored.edges.len(), 1);
+    assert_eq!(stored.edges[0].target_artist_id, member);
+
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}

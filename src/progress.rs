@@ -16,6 +16,9 @@ pub struct GraphProgress {
     pub message: String,
     pub finished: bool,
     pub cancelled: bool,
+    pub paused: bool,
+    pub retry_at: Option<i64>,
+    pub budget_exhausted: bool,
 }
 
 impl GraphProgress {

@@ -19,7 +19,7 @@ const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
 fn version_metadata_json() -> String {
     format!(
-        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{PROVIDER_VERSION}\",\"provider_id\":\"{PROVIDER_ID}\",\"spi_version\":{SPI_VERSION},\"acquisition_modes\":[\"artifact\",\"direct\"],\"channel_policies\":{{\"lastfm_track\":[\"bounded_influence\"],\"lastfm_artist\":[\"bounded_influence\",\"target_share\"]}}}}"
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{PROVIDER_VERSION}\",\"provider_id\":\"{PROVIDER_ID}\",\"spi_version\":{SPI_VERSION},\"acquisition_modes\":[\"artifact\",\"direct\"],\"offline_graph_schema_version\":1,\"graph_commands\":[\"status\",\"sync\",\"compact\",\"delete\"],\"channel_policies\":{{\"lastfm_track\":[\"bounded_influence\"],\"lastfm_artist\":[\"bounded_influence\",\"target_share\"]}}}}"
     )
 }
 
@@ -654,6 +654,10 @@ mod tests {
         assert!(metadata.contains("\"provider_id\":\"lastfm-guidance\""));
         assert!(metadata.contains("\"spi_version\":"));
         assert!(metadata.contains("\"acquisition_modes\":[\"artifact\",\"direct\"]"));
+        assert!(metadata.contains("\"offline_graph_schema_version\":1"));
+        assert!(
+            metadata.contains("\"graph_commands\":[\"status\",\"sync\",\"compact\",\"delete\"]")
+        );
         assert!(metadata.contains("\"lastfm_track\":[\"bounded_influence\"]"));
         assert!(metadata.contains("\"lastfm_artist\":[\"bounded_influence\",\"target_share\"]"));
     }
