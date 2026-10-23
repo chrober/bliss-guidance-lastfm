@@ -283,17 +283,17 @@ impl GraphStore {
             format!("cannot start Last.fm library-membership transaction: {error}")
         })?;
         transaction
+            .execute("DELETE FROM library_artist_membership", [])
+            .map_err(|error| format!("cannot clear prior Last.fm library membership: {error}"))?;
+        transaction
+            .execute("DELETE FROM library_snapshots", [])
+            .map_err(|error| format!("cannot clear prior Last.fm library snapshot: {error}"))?;
+        transaction
             .execute(
                 "INSERT OR REPLACE INTO library_snapshots(snapshot_id, library_identity, created_at) VALUES (?1, ?2, ?3)",
                 params![snapshot_id, library_identity, created_at],
             )
             .map_err(|error| format!("cannot store Last.fm library snapshot: {error}"))?;
-        transaction
-            .execute(
-                "DELETE FROM library_artist_membership WHERE snapshot_id = ?1",
-                [snapshot_id],
-            )
-            .map_err(|error| format!("cannot replace Last.fm library membership: {error}"))?;
         for artist_id in artist_ids {
             transaction
                 .execute(

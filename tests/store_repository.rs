@@ -180,6 +180,22 @@ fn reports_whether_an_artist_belongs_to_the_latest_library_snapshot() {
     assert!(store.is_library_artist(outsider).unwrap());
 
     drop(store);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let snapshots: i64 = connection
+        .query_row("SELECT COUNT(*) FROM library_snapshots", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let memberships: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM library_artist_membership",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(snapshots, 1);
+    assert_eq!(memberships, 1);
+    drop(connection);
     let _ = std::fs::remove_file(path);
 }
 
