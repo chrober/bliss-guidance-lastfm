@@ -4,6 +4,8 @@ mod identity;
 mod repository;
 mod schema;
 
+pub use schema::SCHEMA_VERSION;
+
 pub use identity::{normalize_name, ArtistIdentity};
 pub use repository::{
     ArtistEdgeRecord, ArtistEdgeWrite, ArtistObservationRecord, ArtistObservationWrite,
