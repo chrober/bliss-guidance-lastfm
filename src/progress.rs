@@ -13,6 +13,7 @@ pub struct GraphProgress {
     pub changed: u64,
     pub failures: u64,
     pub database_bytes: u64,
+    pub retained_lastfm_bytes: u64,
     pub message: String,
     pub finished: bool,
     pub cancelled: bool,

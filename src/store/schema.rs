@@ -2,7 +2,7 @@
 
 use rusqlite::Connection;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 pub const BUSY_TIMEOUT_MILLIS: i64 = 5_000;
 
 pub fn initialize(connection: &Connection, created_at: i64) -> Result<(), String> {
@@ -63,7 +63,8 @@ pub fn initialize(connection: &Connection, created_at: i64) -> Result<(), String
                 requested_limit INTEGER NOT NULL,
                 actual_result_count INTEGER NOT NULL,
                 result_status TEXT NOT NULL
-                    CHECK (result_status IN ('positive', 'empty'))
+                    CHECK (result_status IN ('positive', 'empty')),
+                retained_payload_bytes INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS artist_queries_expiry
                 ON artist_queries(expires_at);
@@ -95,53 +96,6 @@ pub fn initialize(connection: &Connection, created_at: i64) -> Result<(), String
             CREATE INDEX IF NOT EXISTS library_artist_membership_artist
                 ON library_artist_membership(artist_id);
 
-            CREATE TABLE IF NOT EXISTS tracks (
-                track_id INTEGER PRIMARY KEY,
-                recording_mbid TEXT,
-                artist_id INTEGER REFERENCES artists(artist_id) ON DELETE SET NULL,
-                canonical_title TEXT NOT NULL,
-                normalized_title TEXT NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS tracks_recording_mbid_unique
-                ON tracks(recording_mbid)
-                WHERE recording_mbid IS NOT NULL AND recording_mbid != '';
-            CREATE UNIQUE INDEX IF NOT EXISTS tracks_name_only_unique
-                ON tracks(artist_id, normalized_title)
-                WHERE recording_mbid IS NULL;
-            CREATE INDEX IF NOT EXISTS tracks_normalized_title
-                ON tracks(normalized_title);
-
-            CREATE TABLE IF NOT EXISTS track_queries (
-                query_id INTEGER PRIMARY KEY,
-                source_track_id INTEGER NOT NULL UNIQUE
-                    REFERENCES tracks(track_id) ON DELETE CASCADE,
-                fetched_at INTEGER NOT NULL,
-                validated_at INTEGER NOT NULL,
-                changed_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                etag TEXT,
-                last_modified TEXT,
-                payload_hash TEXT NOT NULL,
-                acquisition_source TEXT NOT NULL,
-                requested_limit INTEGER NOT NULL,
-                actual_result_count INTEGER NOT NULL,
-                result_status TEXT NOT NULL
-                    CHECK (result_status IN ('positive', 'empty'))
-            );
-            CREATE INDEX IF NOT EXISTS track_queries_expiry
-                ON track_queries(expires_at);
-
-            CREATE TABLE IF NOT EXISTS track_similarity_edges (
-                query_id INTEGER NOT NULL
-                    REFERENCES track_queries(query_id) ON DELETE CASCADE,
-                target_track_id INTEGER NOT NULL
-                    REFERENCES tracks(track_id) ON DELETE RESTRICT,
-                rank INTEGER NOT NULL CHECK (rank > 0),
-                match_score REAL,
-                PRIMARY KEY (query_id, target_track_id)
-            );
-            CREATE INDEX IF NOT EXISTS track_similarity_edges_target
-                ON track_similarity_edges(target_track_id);
             "#
         ))
         .map_err(|error| format!("cannot initialize Last.fm graph schema: {error}"))?;
@@ -153,10 +107,62 @@ pub fn initialize(connection: &Connection, created_at: i64) -> Result<(), String
             |row| row.get(0),
         )
         .map_err(|error| format!("cannot read Last.fm graph schema version: {error}"))?;
-    if actual != SCHEMA_VERSION {
+    if actual > SCHEMA_VERSION {
         return Err(format!(
             "unsupported Last.fm graph schema version {actual}; expected {SCHEMA_VERSION}"
         ));
     }
+    if actual == 1 {
+        add_column_if_missing(
+            connection,
+            "artist_queries",
+            "retained_payload_bytes",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        connection
+            .execute_batch(
+                r#"
+                DROP TABLE IF EXISTS track_similarity_edges;
+                DROP TABLE IF EXISTS track_queries;
+                DROP TABLE IF EXISTS tracks;
+                "#,
+            )
+            .map_err(|error| {
+                format!("cannot remove persisted Last.fm track-similarity data: {error}")
+            })?;
+        connection
+            .execute(
+                "UPDATE metadata SET schema_version = ?1 WHERE metadata_id = 1",
+                [SCHEMA_VERSION],
+            )
+            .map_err(|error| format!("cannot record Last.fm graph schema migration: {error}"))?;
+    }
     Ok(())
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("cannot inspect Last.fm graph table {table}: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("cannot inspect Last.fm graph table {table}: {error}"))?;
+    for existing in columns {
+        if existing
+            .map_err(|error| format!("cannot inspect Last.fm graph table {table}: {error}"))?
+            == column
+        {
+            return Ok(());
+        }
+    }
+    connection
+        .execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {declaration};"
+        ))
+        .map_err(|error| format!("cannot migrate Last.fm graph table {table}: {error}"))
 }

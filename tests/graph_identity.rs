@@ -1,6 +1,5 @@
 use bliss_guidance_lastfm::store::{
     ArtistEdgeWrite, ArtistIdentity, ArtistObservationWrite, GraphStore, ObservationStatus,
-    TrackIdentity,
 };
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -107,59 +106,6 @@ fn batch_lookup_uses_mbids_first_and_only_unambiguous_name_fallbacks() {
         ])
         .unwrap();
     assert_eq!(found, vec![Some(mbid_artist), Some(name_artist), None]);
-}
-
-#[test]
-fn recording_mbid_precedes_the_track_name_fallback() {
-    let path = database_path("track");
-    let store = GraphStore::open(&path).unwrap();
-    let first = store
-        .resolve_or_create_track(
-            &TrackIdentity {
-                recording_mbid: Some("recording-one".to_owned()),
-                artist: artist("Artist One", Some("artist-one")),
-                title: "First title".to_owned(),
-            },
-            10,
-        )
-        .unwrap();
-    let renamed = store
-        .resolve_or_create_track(
-            &TrackIdentity {
-                recording_mbid: Some("RECORDING-ONE".to_owned()),
-                artist: artist("Artist One", Some("artist-one")),
-                title: "Retagged title".to_owned(),
-            },
-            20,
-        )
-        .unwrap();
-    let fallback = store
-        .resolve_or_create_track(
-            &TrackIdentity {
-                recording_mbid: None,
-                artist: artist("Artist Two", None),
-                title: "  Shared   Song ".to_owned(),
-            },
-            20,
-        )
-        .unwrap();
-    let same_fallback = store
-        .resolve_or_create_track(
-            &TrackIdentity {
-                recording_mbid: None,
-                artist: artist("artist two", None),
-                title: "shared song".to_owned(),
-            },
-            30,
-        )
-        .unwrap();
-
-    assert_eq!(first, renamed);
-    assert_eq!(fallback, same_fallback);
-    assert_eq!(
-        store.track(first).unwrap().unwrap().canonical_title,
-        "Retagged title"
-    );
 }
 
 #[test]

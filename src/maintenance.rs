@@ -86,7 +86,12 @@ fn status(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
     if !Path::new(&request.store_path).exists() {
         return emit_json(
             output,
-            &json!({"schema_version":1,"state":"missing","database_bytes":0}),
+            &json!({
+                "schema_version":1,
+                "state":"missing",
+                "database_bytes":0,
+                "retained_lastfm_bytes":legacy_cache_bytes(request),
+            }),
         );
     }
     let store = GraphStore::open(&request.store_path)?;
@@ -97,12 +102,10 @@ fn status(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
             "schema_version": 1,
             "state": "available",
             "database_bytes": database_bytes(&request.store_path),
+            "retained_lastfm_bytes": retained_storage_bytes(&store, request)?,
             "artists": statistics.artists,
             "artist_observations": statistics.artist_observations,
             "artist_edges": statistics.artist_edges,
-            "tracks": statistics.tracks,
-            "track_observations": statistics.track_observations,
-            "track_edges": statistics.track_edges,
             "library_artists": statistics.library_artists,
             "covered_library_artists": statistics.covered_library_artists,
             "external_artists": statistics.external_artists,
@@ -131,6 +134,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     progress.message = format!("Preparing {total} library artists for offline Last.fm update");
     progress.total = total;
     progress.database_bytes = database_bytes(&request.store_path);
+    progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
     emit_json(output, &progress)?;
     let mut artist_ids = Vec::with_capacity(snapshot.artists.len());
     for root in &snapshot.artists {
@@ -151,6 +155,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
 
     progress.message = format!("Prepared {total} library artists; starting Last.fm update");
     progress.database_bytes = database_bytes(&request.store_path);
+    progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
     emit_json(output, &progress)?;
     let client = LastFmClient::new(endpoint, &api_key, Duration::from_secs(30))?;
     for (index, root) in snapshot.artists.iter().enumerate() {
@@ -176,7 +181,8 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         if sufficient {
             progress.cached += 1;
         } else {
-            if total_storage_bytes(request) >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
+            if retained_storage_bytes(&store, request)?
+                >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
             {
                 progress.budget_exhausted = true;
                 progress.finished = true;
@@ -245,11 +251,14 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
             )? {
                 progress.changed += 1;
             }
-            if total_storage_bytes(request) >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
+            progress.current = index as u64 + 1;
+            if retained_storage_bytes(&store, request)?
+                >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
             {
                 progress.budget_exhausted = true;
                 progress.finished = true;
                 progress.database_bytes = database_bytes(&request.store_path);
+                progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
                 progress.message =
                     "Last.fm graph storage budget was reached after the current artist".to_owned();
                 emit_json(output, &progress)?;
@@ -261,6 +270,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         }
         progress.current = index as u64 + 1;
         progress.database_bytes = database_bytes(&request.store_path);
+        progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
         progress.message = format!("Updated {}/{} library artists", progress.current, total);
         emit_json(output, &progress)?;
     }
@@ -282,6 +292,7 @@ fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String
             "schema_version":1,
             "state":"compacted",
             "database_bytes":database_bytes(&request.store_path),
+            "retained_lastfm_bytes":retained_storage_bytes(&store, request)?,
             "artist_edges":statistics.artist_edges,
         }),
     )
@@ -330,13 +341,18 @@ fn database_bytes(store_path: &str) -> u64 {
         .sum()
 }
 
-fn total_storage_bytes(request: &GraphRequest) -> u64 {
-    database_bytes(&request.store_path)
-        + request
-            .legacy_cache_path
-            .as_deref()
-            .and_then(|path| std::fs::metadata(path).ok().map(|value| value.len()))
-            .unwrap_or(0)
+fn retained_storage_bytes(store: &GraphStore, request: &GraphRequest) -> Result<u64, String> {
+    store
+        .retained_lastfm_bytes()
+        .map(|bytes| bytes.saturating_add(legacy_cache_bytes(request)))
+}
+
+fn legacy_cache_bytes(request: &GraphRequest) -> u64 {
+    request
+        .legacy_cache_path
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok().map(|value| value.len()))
+        .unwrap_or(0)
 }
 
 fn unix_seconds() -> i64 {

@@ -4,10 +4,9 @@ mod identity;
 mod repository;
 mod schema;
 
-pub use identity::{normalize_name, ArtistIdentity, TrackIdentity};
+pub use identity::{normalize_name, ArtistIdentity};
 pub use repository::{
     ArtistEdgeRecord, ArtistEdgeWrite, ArtistObservationRecord, ArtistObservationWrite,
     ArtistRecord, GraphStatistics, GraphStore, LegacyArtistObservation, LegacyArtistTarget,
-    LegacyGraphImport, LegacyTrackObservation, LegacyTrackTarget, ObservationStatus,
-    ObservationValidation, TrackEdgeRecord, TrackObservationRecord, TrackRecord,
+    LegacyGraphImport, ObservationStatus, ObservationValidation,
 };

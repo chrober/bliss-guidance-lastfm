@@ -36,7 +36,7 @@ fn creates_versioned_schema_with_wal_and_busy_timeout() {
     let path = database_path("schema");
     let store = GraphStore::open(&path).unwrap();
 
-    assert_eq!(store.schema_version().unwrap(), 1);
+    assert_eq!(store.schema_version().unwrap(), 2);
     assert_eq!(store.journal_mode().unwrap(), "wal");
     assert!(store.busy_timeout_millis().unwrap() >= 5_000);
     for table in [
@@ -47,12 +47,167 @@ fn creates_versioned_schema_with_wal_and_busy_timeout() {
         "artist_similarity_edges",
         "library_snapshots",
         "library_artist_membership",
-        "tracks",
-        "track_queries",
-        "track_similarity_edges",
     ] {
         assert!(store.has_table(table).unwrap(), "missing table {table}");
     }
+    for table in ["tracks", "track_queries", "track_similarity_edges"] {
+        assert!(!store.has_table(table).unwrap(), "unexpected table {table}");
+    }
+
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn accounts_only_the_canonical_lastfm_payload_retained_by_an_observation() {
+    let path = database_path("retained-payload");
+    let mut store = GraphStore::open(&path).unwrap();
+    let source = store
+        .upsert_artist(None, "Local Source", 1_700_000_000)
+        .unwrap();
+    let target = store
+        .upsert_artist(Some("target-mbid"), "Target Artist", 1_700_000_000)
+        .unwrap();
+
+    store
+        .replace_artist_observation(
+            source,
+            &observation("payload-one", ObservationStatus::Positive),
+            &[ArtistEdgeWrite {
+                target_artist_id: target,
+                rank: 1,
+                match_score: Some(0.91),
+            }],
+        )
+        .unwrap();
+
+    let expected = serde_json::to_vec(&serde_json::json!({
+        "etag": "etag-one",
+        "last_modified": "Wed, 21 Oct 2015 07:28:00 GMT",
+        "results": [{
+            "mbid": "target-mbid",
+            "name": "Target Artist",
+            "rank": 1,
+            "score": 0.91
+        }]
+    }))
+    .unwrap()
+    .len() as u64;
+    assert_eq!(store.retained_lastfm_bytes().unwrap(), expected);
+
+    let mut empty = observation("payload-empty", ObservationStatus::Empty);
+    empty.actual_result_count = 0;
+    store
+        .replace_artist_observation(source, &empty, &[])
+        .unwrap();
+    let expected_empty = serde_json::to_vec(&serde_json::json!({
+        "etag": "etag-one",
+        "last_modified": "Wed, 21 Oct 2015 07:28:00 GMT",
+        "results": []
+    }))
+    .unwrap()
+    .len() as u64;
+    assert_eq!(store.retained_lastfm_bytes().unwrap(), expected_empty);
+
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn migrates_v1_observations_and_backfills_retained_lastfm_bytes() {
+    let path = database_path("v1-retained-migration");
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            r#"
+            CREATE TABLE metadata (
+                metadata_id INTEGER PRIMARY KEY CHECK (metadata_id = 1),
+                schema_version INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                migrated_from_json_at INTEGER
+            );
+            INSERT INTO metadata VALUES (1, 1, 1700000000, NULL);
+            CREATE TABLE artists (
+                artist_id INTEGER PRIMARY KEY,
+                artist_mbid TEXT,
+                canonical_name TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                first_seen_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            );
+            INSERT INTO artists VALUES (1, NULL, 'Local Source', 'local source', 1700000000, 1700000000);
+            INSERT INTO artists VALUES (2, 'target-mbid', 'Target Artist', 'target artist', 1700000000, 1700000000);
+            CREATE TABLE artist_queries (
+                query_id INTEGER PRIMARY KEY,
+                source_artist_id INTEGER NOT NULL UNIQUE REFERENCES artists(artist_id) ON DELETE CASCADE,
+                fetched_at INTEGER NOT NULL,
+                validated_at INTEGER NOT NULL,
+                changed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                etag TEXT,
+                last_modified TEXT,
+                payload_hash TEXT NOT NULL,
+                acquisition_source TEXT NOT NULL,
+                requested_limit INTEGER NOT NULL,
+                actual_result_count INTEGER NOT NULL,
+                result_status TEXT NOT NULL CHECK (result_status IN ('positive', 'empty'))
+            );
+            INSERT INTO artist_queries VALUES (
+                1, 1, 1700000000, 1700000001, 1700000002, 1700003600,
+                'etag-one', 'Wed, 21 Oct 2015 07:28:00 GMT', 'legacy-hash',
+                'api_key', 25, 1, 'positive'
+            );
+            CREATE TABLE artist_similarity_edges (
+                query_id INTEGER NOT NULL REFERENCES artist_queries(query_id) ON DELETE CASCADE,
+                target_artist_id INTEGER NOT NULL REFERENCES artists(artist_id) ON DELETE RESTRICT,
+                rank INTEGER NOT NULL CHECK (rank > 0),
+                match_score REAL,
+                PRIMARY KEY (query_id, target_artist_id)
+            );
+            INSERT INTO artist_similarity_edges VALUES (1, 2, 1, 0.91);
+            CREATE TABLE tracks (
+                track_id INTEGER PRIMARY KEY,
+                recording_mbid TEXT,
+                artist_id INTEGER REFERENCES artists(artist_id),
+                canonical_title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL
+            );
+            CREATE TABLE track_queries (
+                query_id INTEGER PRIMARY KEY,
+                source_track_id INTEGER NOT NULL UNIQUE REFERENCES tracks(track_id),
+                fetched_at INTEGER NOT NULL,
+                validated_at INTEGER NOT NULL,
+                changed_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                etag TEXT,
+                last_modified TEXT,
+                payload_hash TEXT NOT NULL,
+                acquisition_source TEXT NOT NULL,
+                requested_limit INTEGER NOT NULL,
+                actual_result_count INTEGER NOT NULL,
+                result_status TEXT NOT NULL
+            );
+            CREATE TABLE track_similarity_edges (
+                query_id INTEGER NOT NULL REFERENCES track_queries(query_id),
+                target_track_id INTEGER NOT NULL REFERENCES tracks(track_id),
+                rank INTEGER NOT NULL,
+                match_score REAL,
+                PRIMARY KEY (query_id, target_track_id)
+            );
+            "#,
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = GraphStore::open(&path).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 2);
+    assert!(!store.has_table("tracks").unwrap());
+    assert!(!store.has_table("track_queries").unwrap());
+    assert!(!store.has_table("track_similarity_edges").unwrap());
+    assert!(store.retained_lastfm_bytes().unwrap() > 0);
+    let stored = store.artist_observation(1).unwrap().unwrap();
+    assert_eq!(stored.payload_hash, "legacy-hash");
+    assert_eq!(stored.edges.len(), 1);
 
     drop(store);
     let _ = std::fs::remove_file(path);
@@ -259,11 +414,13 @@ fn compaction_applies_the_current_result_limit_and_local_artist_scope() {
             ],
         )
         .unwrap();
+    let retained_before_compaction = store.retained_lastfm_bytes().unwrap();
 
     store.checkpoint_and_compact(25, true).unwrap();
     let stored = store.artist_observation(source).unwrap().unwrap();
     assert_eq!(stored.edges.len(), 1);
     assert_eq!(stored.edges[0].target_artist_id, member);
+    assert!(store.retained_lastfm_bytes().unwrap() < retained_before_compaction);
 
     drop(store);
     let _ = std::fs::remove_file(path);

@@ -1,5 +1,5 @@
 use bliss_guidance_lastfm::legacy_cache::{migrate_legacy_cache, MigrationOutcome};
-use bliss_guidance_lastfm::store::{ArtistIdentity, GraphStore, ObservationStatus, TrackIdentity};
+use bliss_guidance_lastfm::store::{ArtistIdentity, GraphStore, ObservationStatus};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,7 +26,7 @@ fn copy_fixture(name: &str, target: &PathBuf) {
 }
 
 #[test]
-fn imports_positive_empty_artist_and_track_entries_once() {
+fn imports_artist_entries_and_preserves_track_entries_outside_sqlite() {
     let legacy = temporary_path("valid", "json");
     let database = temporary_path("valid", "sqlite");
     copy_fixture("lastfm-cache-v1.json", &legacy);
@@ -38,10 +38,10 @@ fn imports_positive_empty_artist_and_track_entries_once() {
         MigrationOutcome::Imported {
             entries: 3,
             artist_observations: 2,
-            track_observations: 1,
+            preserved_track_entries: 1,
         }
     );
-    assert!(!legacy.exists());
+    assert!(legacy.exists());
     assert_eq!(store.migrated_from_json_at().unwrap(), Some(1_800_000_000));
 
     let source = store
@@ -68,20 +68,12 @@ fn imports_positive_empty_artist_and_track_entries_once() {
     assert_eq!(empty.result_status, ObservationStatus::Empty);
     assert!(empty.edges.is_empty());
 
-    let track = store
-        .find_track(&TrackIdentity {
-            recording_mbid: None,
-            artist: ArtistIdentity {
-                mbid: None,
-                name: "Seed Artist".to_owned(),
-            },
-            title: "Seed Song".to_owned(),
-        })
-        .unwrap()
-        .unwrap();
-    let track_observation = store.track_observation(track).unwrap().unwrap();
-    assert_eq!(track_observation.fetched_at, 1_700_000_200);
-    assert_eq!(track_observation.edges.len(), 1);
+    let retained: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&legacy).unwrap()).unwrap();
+    let entries = retained["entries"].as_object().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(entries.contains_key("track:seed artist|seed song"));
+    assert!(!store.has_table("tracks").unwrap());
 
     assert_eq!(
         migrate_legacy_cache(&legacy, &mut store, 1_900_000_000).unwrap(),
@@ -90,6 +82,7 @@ fn imports_positive_empty_artist_and_track_entries_once() {
     assert_eq!(store.migrated_from_json_at().unwrap(), Some(1_800_000_000));
 
     drop(store);
+    let _ = std::fs::remove_file(legacy);
     let _ = std::fs::remove_file(database);
 }
 

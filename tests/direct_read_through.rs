@@ -19,10 +19,12 @@ fn store_path() -> std::path::PathBuf {
 }
 
 fn options(endpoint: &str, store: &std::path::Path, policy: &str) -> DirectOptions {
+    let legacy_cache = store.with_extension("json");
     DirectOptions::from_prepare_options(&serde_json::json!({
         "acquisition_mode": "direct",
         "api_endpoint": endpoint,
         "store_path": store,
+        "legacy_cache_path": legacy_cache,
         "retrieval_policy": policy,
         "artist_result_limit": 25,
         "storage_scope": "all_returned_artists",
@@ -113,12 +115,15 @@ fn online_fill_is_reused_by_a_new_offline_only_session() {
         offline.signals(&context, &[candidate()])
     );
     assert_eq!(offline.signals(&context, &[candidate()]).len(), 2);
+    let graph = bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
+    assert!(!graph.has_table("tracks").unwrap());
 
     std::env::remove_var(API_KEY_ENVIRONMENT);
     drop(online);
     drop(offline);
     thread::sleep(Duration::from_millis(10));
-    let _ = std::fs::remove_file(store);
+    let _ = std::fs::remove_file(&store);
+    let _ = std::fs::remove_file(store.with_extension("json"));
 }
 
 #[test]
@@ -145,5 +150,6 @@ fn offline_only_missing_data_is_neutral_and_makes_no_request() {
         )
         .is_empty());
     std::env::remove_var(API_KEY_ENVIRONMENT);
-    let _ = std::fs::remove_file(store);
+    let _ = std::fs::remove_file(&store);
+    let _ = std::fs::remove_file(store.with_extension("json"));
 }

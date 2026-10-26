@@ -83,7 +83,6 @@ fn conditional_request_accepts_not_modified_without_parsing_a_body() {
             }),
         )
         .unwrap();
-
     assert_eq!(result.status, ResponseStatus::NotModified);
     assert!(result.results.is_empty());
     let request = server.join().unwrap();
@@ -213,6 +212,7 @@ fn revalidation_preserves_edges_and_change_time_for_304_and_unchanged_200() {
             }],
         )
         .unwrap();
+    let before_revalidation_bytes = store.retained_lastfm_bytes().unwrap();
 
     store
         .revalidate_artist_observation(
@@ -233,6 +233,8 @@ fn revalidation_preserves_edges_and_change_time_for_304_and_unchanged_200() {
     assert_eq!(after_304.validated_at, 300);
     assert_eq!(after_304.changed_at, 100);
     assert_eq!(after_304.edges.len(), 1);
+    let after_304_bytes = store.retained_lastfm_bytes().unwrap();
+    assert!(after_304_bytes > before_revalidation_bytes);
 
     store
         .revalidate_artist_observation(
@@ -253,6 +255,7 @@ fn revalidation_preserves_edges_and_change_time_for_304_and_unchanged_200() {
     assert_eq!(unchanged_200.changed_at, 100);
     assert_eq!(unchanged_200.requested_limit, 50);
     assert_eq!(unchanged_200.edges.len(), 1);
+    assert_eq!(store.retained_lastfm_bytes().unwrap(), after_304_bytes);
 
     drop(store);
     let _ = std::fs::remove_file(path);

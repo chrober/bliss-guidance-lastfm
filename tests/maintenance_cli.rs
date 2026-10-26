@@ -39,19 +39,29 @@ fn run(command: &str, request: &std::path::Path) -> std::process::Output {
 #[test]
 fn status_is_read_only_and_reports_a_missing_or_available_graph() {
     let store = temp_path("status", "sqlite");
-    let request_path = request(&store, serde_json::json!({}));
+    let legacy_cache = temp_path("legacy-status", "json");
+    fs::write(&legacy_cache, b"legacy-lastfm-data").unwrap();
+    let request_path = request(
+        &store,
+        serde_json::json!({"legacy_cache_path":legacy_cache}),
+    );
     let output = run("status", &request_path);
     assert!(output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["state"], "missing");
+    assert_eq!(value["database_bytes"], 0);
+    assert_eq!(value["retained_lastfm_bytes"], 18);
 
     bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
     let output = run("status", &request_path);
     assert!(output.status.success());
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["state"], "available");
+    assert!(value["database_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(value["retained_lastfm_bytes"], 18);
     let _ = fs::remove_file(request_path);
     let _ = fs::remove_file(store);
+    let _ = fs::remove_file(legacy_cache);
 }
 
 #[test]
@@ -109,7 +119,8 @@ fn sync_emits_versioned_progress_and_persists_one_root() {
             "acquisition_mode":"direct",
             "roots_path":roots,
             "api_endpoint":endpoint,
-            "artist_result_limit":25
+            "artist_result_limit":25,
+            "budget_bytes":1
         }),
     );
     let output = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
@@ -127,6 +138,7 @@ fn sync_emits_versioned_progress_and_persists_one_root() {
     let events = String::from_utf8(output.stdout).unwrap();
     assert!(events.contains("lastfm_graph_progress_v1"));
     assert!(events.contains("\"finished\":true"));
+    assert!(events.contains("\"budget_exhausted\":true"));
     let first_event: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
     assert_eq!(first_event["current"], 0);
     assert_eq!(first_event["total"], 1);
@@ -134,9 +146,13 @@ fn sync_emits_versioned_progress_and_persists_one_root() {
         .as_str()
         .unwrap()
         .starts_with("Preparing 1 library artists"));
+    let last_event: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
+    assert_eq!(last_event["current"], 1);
+    assert!(last_event["retained_lastfm_bytes"].as_u64().unwrap() > 1);
     let graph = bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
     assert_eq!(graph.statistics().unwrap().artist_observations, 1);
     assert_eq!(graph.statistics().unwrap().artist_edges, 1);
+    assert!(graph.retained_lastfm_bytes().unwrap() > 1);
     drop(graph);
     let _ = fs::remove_file(request_path);
     let _ = fs::remove_file(store);

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
+use crate::lastfm_api::SimilarTrack;
 use crate::store::{
     ArtistIdentity, ArtistObservationWrite, GraphStore, LegacyArtistObservation,
-    LegacyArtistTarget, LegacyGraphImport, LegacyTrackObservation, LegacyTrackTarget,
-    ObservationStatus, TrackIdentity,
+    LegacyArtistTarget, LegacyGraphImport, ObservationStatus,
 };
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -23,7 +23,7 @@ pub enum MigrationOutcome {
     Imported {
         entries: usize,
         artist_observations: usize,
-        track_observations: usize,
+        preserved_track_entries: usize,
     },
     AlreadyMigrated,
     NoLegacyCache,
@@ -32,13 +32,13 @@ pub enum MigrationOutcome {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CacheEntry {
     fetched_at_unix_seconds: i64,
     value: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct CacheFile {
     schema_version: u8,
     entries: BTreeMap<String, CacheEntry>,
@@ -48,15 +48,6 @@ struct CacheFile {
 struct CachedSimilarArtist {
     name: String,
     mbid: Option<String>,
-    score: Option<f64>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct CachedSimilarTrack {
-    artist: String,
-    title: String,
-    artist_mbid: Option<String>,
-    recording_mbid: Option<String>,
     score: Option<f64>,
 }
 
@@ -103,19 +94,131 @@ pub fn migrate_legacy_cache(
         }
     };
     let entry_count = cache.entries.len();
+    let preserved_entries = cache
+        .entries
+        .iter()
+        .filter(|(key, _)| !key.starts_with("artist:"))
+        .map(|(key, entry)| {
+            (
+                key.clone(),
+                CacheEntry {
+                    fetched_at_unix_seconds: entry.fetched_at_unix_seconds,
+                    value: entry.value.clone(),
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let preserved_track_entries = preserved_entries
+        .keys()
+        .filter(|key| key.starts_with("track:"))
+        .count();
     let import = decode_import(cache)?;
     let artist_observations = import.artists.len();
-    let track_observations = import.tracks.len();
     store.import_legacy_graph(&import, migrated_at)?;
-    fs::remove_file(path)
-        .map_err(|error| format!("cannot remove migrated Last.fm cache: {error}"))?;
+    if preserved_entries.is_empty() {
+        fs::remove_file(path)
+            .map_err(|error| format!("cannot remove migrated Last.fm cache: {error}"))?;
+    } else {
+        let retained = serde_json::to_vec_pretty(&CacheFile {
+            schema_version: CACHE_SCHEMA_VERSION,
+            entries: preserved_entries,
+        })
+        .map_err(|error| format!("cannot encode retained Last.fm track cache: {error}"))?;
+        let temporary_path = path.with_extension("migration.tmp");
+        fs::write(&temporary_path, retained)
+            .map_err(|error| format!("cannot write retained Last.fm track cache: {error}"))?;
+        fs::rename(&temporary_path, path)
+            .map_err(|error| format!("cannot replace migrated Last.fm cache: {error}"))?;
+    }
     FileExt::unlock(&lock)
         .map_err(|error| format!("cannot unlock legacy Last.fm cache: {error}"))?;
     Ok(MigrationOutcome::Imported {
         entries: entry_count,
         artist_observations,
-        track_observations,
+        preserved_track_entries,
     })
+}
+
+pub fn cached_tracks(
+    path: impl AsRef<Path>,
+    key: &str,
+    now: i64,
+) -> Result<Option<Vec<SimilarTrack>>, String> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)
+        .map_err(|error| format!("cannot read non-persistent Last.fm track cache: {error}"))?;
+    let Ok(cache) = serde_json::from_slice::<CacheFile>(&bytes) else {
+        return Ok(None);
+    };
+    if cache.schema_version != CACHE_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    let Some(entry) = cache.entries.get(&format!("track:{key}")) else {
+        return Ok(None);
+    };
+    if entry
+        .fetched_at_unix_seconds
+        .saturating_add(TRACK_TTL_SECONDS)
+        <= now
+    {
+        return Ok(None);
+    }
+    serde_json::from_value(entry.value.clone())
+        .map(Some)
+        .map_err(|error| format!("cannot decode non-persistent Last.fm track cache: {error}"))
+}
+
+pub fn cache_tracks(
+    path: impl AsRef<Path>,
+    key: &str,
+    fetched_at: i64,
+    tracks: &[SimilarTrack],
+) -> Result<(), String> {
+    let path = path.as_ref();
+    let lock_path = path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|error| format!("cannot open Last.fm track-cache lock: {error}"))?;
+    lock.lock_exclusive()
+        .map_err(|error| format!("cannot lock Last.fm track cache: {error}"))?;
+    let mut cache = if path.exists() {
+        fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<CacheFile>(&bytes).ok())
+            .filter(|cache| cache.schema_version == CACHE_SCHEMA_VERSION)
+            .unwrap_or(CacheFile {
+                schema_version: CACHE_SCHEMA_VERSION,
+                entries: BTreeMap::new(),
+            })
+    } else {
+        CacheFile {
+            schema_version: CACHE_SCHEMA_VERSION,
+            entries: BTreeMap::new(),
+        }
+    };
+    cache.entries.insert(
+        format!("track:{key}"),
+        CacheEntry {
+            fetched_at_unix_seconds: fetched_at,
+            value: serde_json::to_value(tracks)
+                .map_err(|error| format!("cannot encode Last.fm track cache: {error}"))?,
+        },
+    );
+    let bytes = serde_json::to_vec_pretty(&cache)
+        .map_err(|error| format!("cannot encode Last.fm track cache: {error}"))?;
+    let temporary_path = path.with_extension("track-cache.tmp");
+    fs::write(&temporary_path, bytes)
+        .map_err(|error| format!("cannot write Last.fm track cache: {error}"))?;
+    fs::rename(&temporary_path, path)
+        .map_err(|error| format!("cannot replace Last.fm track cache: {error}"))?;
+    FileExt::unlock(&lock).map_err(|error| format!("cannot unlock Last.fm track cache: {error}"))
 }
 
 fn decode_import(cache: CacheFile) -> Result<LegacyGraphImport, String> {
@@ -153,40 +256,6 @@ fn decode_import(cache: CacheFile) -> Result<LegacyGraphImport, String> {
                     })
                     .collect(),
             });
-        } else if let Some(source_key) = key.strip_prefix("track:") {
-            let targets = serde_json::from_value::<Vec<CachedSimilarTrack>>(entry.value.clone())
-                .map_err(|error| format!("cannot decode legacy Last.fm track entry: {error}"))?;
-            let status = status(targets.len());
-            import.tracks.push(LegacyTrackObservation {
-                source: track_source(source_key),
-                observation: observation(
-                    entry.fetched_at_unix_seconds,
-                    &entry.value,
-                    targets.len(),
-                    status,
-                    if targets.is_empty() {
-                        EMPTY_TTL_SECONDS
-                    } else {
-                        TRACK_TTL_SECONDS
-                    },
-                )?,
-                targets: targets
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, target)| LegacyTrackTarget {
-                        identity: TrackIdentity {
-                            recording_mbid: target.recording_mbid,
-                            artist: ArtistIdentity {
-                                mbid: target.artist_mbid,
-                                name: target.artist,
-                            },
-                            title: target.title,
-                        },
-                        rank: index as u32 + 1,
-                        match_score: target.score,
-                    })
-                    .collect(),
-            });
         }
     }
     Ok(import)
@@ -202,28 +271,6 @@ fn artist_source(key: &str) -> ArtistIdentity {
         ArtistIdentity {
             mbid: None,
             name: key.to_owned(),
-        }
-    }
-}
-
-fn track_source(key: &str) -> TrackIdentity {
-    if let Some((artist, title)) = key.split_once('|') {
-        TrackIdentity {
-            recording_mbid: None,
-            artist: ArtistIdentity {
-                mbid: None,
-                name: artist.to_owned(),
-            },
-            title: title.to_owned(),
-        }
-    } else {
-        TrackIdentity {
-            recording_mbid: Some(key.to_owned()),
-            artist: ArtistIdentity {
-                mbid: None,
-                name: "unknown migrated Last.fm artist".to_owned(),
-            },
-            title: key.to_owned(),
         }
     }
 }

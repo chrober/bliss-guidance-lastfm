@@ -123,13 +123,25 @@ bliss-guidance-lastfm graph delete  --request request.json
 Lyrion contributor IDs, names, and available Artist MBIDs. It skips sufficient
 fresh observations, limits network traffic to one worker and at most one call
 per second, persists each complete response, and emits
-`lastfm_graph_progress_v1` JSONL. Cancellation, rate limiting, and the 80 MB
-operating budget leave already committed roots resumable. `compact` trims
+`lastfm_graph_progress_v1` JSONL. Cancellation, rate limiting, and the 80 MiB
+retained-Last.fm-data safety budget leave already committed roots resumable.
+The budget counts a deterministic canonical representation of stored Last.fm
+result identities, ranks, scores, and HTTP validators; it does not count
+SQLite pages, indexes, WAL, SHM, or Lyrion-owned identities. Physical SQLite
+storage is reported separately. `compact` trims
 stored artist edges to the current result limit and optional local-library
 scope before checkpointing SQLite. `delete` requires explicit confirmation.
 
 The maintenance and graph paths are unreachable in artifact/LastMix mode.
 That mode neither opens nor reports the SQLite graph.
+
+The SQLite store is deliberately artist-only: it persists artist identities,
+`artist.getSimilar` observations, directed artist edges, freshness data, and
+local library membership. Job-time `track.getSimilar` results may still use the
+separate short-lived JSON cache, but track identities, queries, and edges are
+never written to SQLite. Schema-v1 databases are migrated by removing their
+former track tables. Local/internal fields do not consume the retained Last.fm
+data budget.
 
 The native `offline_only` retrieval policy is available for controlled testing.
 The Lyrion provider does not expose it as a supported user option while the

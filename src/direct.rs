@@ -5,7 +5,7 @@ use crate::lastfm_api::{
 };
 use crate::store::{
     ArtistEdgeWrite, ArtistIdentity, ArtistObservationRecord, ArtistObservationWrite, GraphStore,
-    ObservationStatus, ObservationValidation, TrackIdentity, TrackObservationRecord,
+    ObservationStatus, ObservationValidation,
 };
 use bliss_playlist_guidance_spi::{Anchor, Candidate, Diagnostics, ScoreContext};
 use serde_json::Value;
@@ -187,11 +187,9 @@ struct DirectRelation {
 enum FetchTask {
     Track {
         key: String,
-        source_id: i64,
         artist: String,
         title: String,
         recording_mbid: Option<String>,
-        existing: Option<TrackObservationRecord>,
     },
     Artist {
         key: String,
@@ -217,10 +215,7 @@ impl FetchTask {
 
     fn validators(&self) -> Option<Validators> {
         match self {
-            Self::Track { existing, .. } => existing.as_ref().map(|value| Validators {
-                etag: value.etag.clone(),
-                last_modified: value.last_modified.clone(),
-            }),
+            Self::Track { .. } => None,
             Self::Artist { existing, .. } => existing.as_ref().map(|value| Validators {
                 etag: value.etag.clone(),
                 last_modified: value.last_modified.clone(),
@@ -388,38 +383,20 @@ impl DirectPrepared {
         let mut tracks = HashMap::<String, Vec<SimilarTrack>>::new();
         let mut misses = Vec::new();
         for (key, (artist, title, mbid)) in &track_queries {
-            let identity = TrackIdentity {
-                recording_mbid: mbid.clone(),
-                artist: ArtistIdentity {
-                    mbid: None,
-                    name: artist.clone(),
-                },
-                title: title.clone(),
-            };
-            let source_id = store.resolve_or_create_track(&identity, now)?;
-            let existing = store.track_observation(source_id)?;
             let task = FetchTask::Track {
                 key: key.clone(),
-                source_id,
                 artist: artist.clone(),
                 title: title.clone(),
                 recording_mbid: mbid.clone(),
-                existing: existing.clone(),
             };
-            let fresh = existing
-                .as_ref()
-                .is_some_and(|value| value.expires_at > now);
-            let use_stored = fresh
-                || matches!(
-                    options.retrieval_policy,
-                    RetrievalPolicy::OfflinePreferred | RetrievalPolicy::OfflineOnly
-                ) && existing.is_some();
-            if use_stored {
+            let cached = options
+                .legacy_cache_path
+                .as_deref()
+                .map(|path| crate::legacy_cache::cached_tracks(path, key, now))
+                .transpose()?
+                .flatten();
+            if let Some(value) = cached {
                 cache_hits += 1;
-                if !fresh {
-                    stale_offline += 1;
-                }
-                let value = stored_tracks(&store, existing.as_ref().unwrap())?;
                 let result_count = value.len();
                 if wants_info(&options.diagnostic_level) {
                     push_log_event(
@@ -428,27 +405,12 @@ impl DirectPrepared {
                         "lastfm_lookup_completed",
                         Some(task.operation()),
                         Some(task.source()),
-                        Some(if fresh { "hit" } else { "stale_offline" }),
+                        Some("hit"),
                         Some(result_count),
                         None,
                     );
                 }
-                if wants_debug(&options.diagnostic_level) {
-                    push_log_event(
-                        &mut log_events,
-                        "debug",
-                        "lastfm_response_json",
-                        Some(task.operation()),
-                        Some(task.source()),
-                        Some("hit"),
-                        Some(result_count),
-                        Some(serde_json::json!({"results": value})),
-                    );
-                }
                 tracks.insert(key.clone(), value);
-                if !fresh && options.retrieval_policy == RetrievalPolicy::OfflinePreferred {
-                    misses.push(task);
-                }
             } else if options.retrieval_policy == RetrievalPolicy::OfflineOnly {
                 missing += 1;
             } else {
@@ -619,18 +581,22 @@ impl DirectPrepared {
                     Some(serde_json::json!({"results": debug_results})),
                 );
             }
-            let persisted =
-                persist_response(&mut store, &task, &response, now, options.storage_scope);
-            if persisted.is_err() {
+            if matches!(response, FetchResponse::Artist(_))
+                && persist_response(&mut store, &task, &response, now, options.storage_scope)
+                    .is_err()
+            {
                 persistence_failed += 1;
             }
             match response {
                 FetchResponse::Track(value) => {
-                    if value.status == ResponseStatus::Modified {
-                        tracks.insert(key, value.results);
-                    } else if let Some(existing) = task_track_observation(&task) {
-                        tracks.insert(key, stored_tracks(&store, existing)?);
+                    if let Some(path) = options.legacy_cache_path.as_deref() {
+                        if crate::legacy_cache::cache_tracks(path, &key, now, &value.results)
+                            .is_err()
+                        {
+                            persistence_failed += 1;
+                        }
                     }
+                    tracks.insert(key, value.results);
                 }
                 FetchResponse::Artist(value) => {
                     if value.status == ResponseStatus::Modified {
@@ -793,13 +759,6 @@ impl DirectPrepared {
     }
 }
 
-fn task_track_observation(task: &FetchTask) -> Option<&TrackObservationRecord> {
-    match task {
-        FetchTask::Track { existing, .. } => existing.as_ref(),
-        FetchTask::Artist { .. } => None,
-    }
-}
-
 fn task_artist_observation(task: &FetchTask) -> Option<&ArtistObservationRecord> {
     match task {
         FetchTask::Artist { existing, .. } => existing.as_ref(),
@@ -823,31 +782,6 @@ fn stored_artists(
             Ok(SimilarArtist {
                 name: target.canonical_name,
                 mbid: target.mbid,
-                score: edge.match_score,
-            })
-        })
-        .collect()
-}
-
-fn stored_tracks(
-    store: &GraphStore,
-    observation: &TrackObservationRecord,
-) -> Result<Vec<SimilarTrack>, String> {
-    observation
-        .edges
-        .iter()
-        .map(|edge| {
-            let target = store
-                .track(edge.target_track_id)?
-                .ok_or_else(|| "Last.fm track edge target is missing".to_owned())?;
-            let artist = store
-                .artist(target.artist_id)?
-                .ok_or_else(|| "Last.fm track artist is missing".to_owned())?;
-            Ok(SimilarTrack {
-                artist: artist.canonical_name,
-                title: target.canonical_title,
-                artist_mbid: artist.mbid,
-                recording_mbid: target.recording_mbid,
                 score: edge.match_score,
             })
         })
@@ -943,71 +877,7 @@ fn persist_response(
                 &edges,
             )
         }
-        (
-            FetchTask::Track {
-                source_id,
-                key,
-                existing,
-                ..
-            },
-            FetchResponse::Track(response),
-        ) => {
-            let expiry = expires_at(
-                now,
-                response.headers.cache_control.as_deref(),
-                response.headers.expires.as_deref(),
-                FreshnessClass::Track,
-            );
-            if response.status == ResponseStatus::NotModified {
-                return store.revalidate_track_observation(
-                    *source_id,
-                    &validation(response, None, now, expiry),
-                );
-            }
-            let hash_rows = response
-                .results
-                .iter()
-                .enumerate()
-                .map(|(index, target)| {
-                    (
-                        target.recording_mbid.as_deref().unwrap_or(""),
-                        target.title.as_str(),
-                        index as u32 + 1,
-                        target.score,
-                    )
-                })
-                .collect::<Vec<_>>();
-            let hash = canonical_artist_payload_hash("track.getSimilar", key, &hash_rows);
-            if existing
-                .as_ref()
-                .is_some_and(|value| value.payload_hash == hash)
-            {
-                return store.revalidate_track_observation(
-                    *source_id,
-                    &validation(response, Some(response.requested_limit), now, expiry),
-                );
-            }
-            let mut edges = Vec::with_capacity(response.results.len());
-            for (index, target) in response.results.iter().enumerate() {
-                let target_id = store.resolve_or_create_track(
-                    &TrackIdentity {
-                        recording_mbid: target.recording_mbid.clone(),
-                        artist: ArtistIdentity {
-                            mbid: target.artist_mbid.clone(),
-                            name: target.artist.clone(),
-                        },
-                        title: target.title.clone(),
-                    },
-                    now,
-                )?;
-                edges.push((target_id, index as u32 + 1, target.score));
-            }
-            store.replace_track_observation(
-                *source_id,
-                &observation_write(response, hash, now, expiry),
-                &edges,
-            )
-        }
+        (FetchTask::Track { .. }, FetchResponse::Track(_)) => Ok(()),
         _ => Err("Last.fm fetch task and response do not match".to_owned()),
     }
 }
