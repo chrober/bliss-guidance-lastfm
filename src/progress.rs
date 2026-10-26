@@ -14,6 +14,8 @@ pub struct GraphProgress {
     pub failures: u64,
     pub database_bytes: u64,
     pub retained_lastfm_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_artist: Option<String>,
     pub message: String,
     pub finished: bool,
     pub cancelled: bool,

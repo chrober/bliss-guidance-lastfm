@@ -146,8 +146,19 @@ fn sync_emits_versioned_progress_and_persists_one_root() {
         .as_str()
         .unwrap()
         .starts_with("Preparing 1 library artists"));
+    let parsed_events: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let fetching_event = parsed_events
+        .iter()
+        .find(|event| event["current_artist"] == "Seed Artist")
+        .expect("sync progress identifies the artist currently being fetched");
+    assert_eq!(fetching_event["current"], 0);
+    assert_eq!(fetching_event["retained_lastfm_bytes"], 0);
     let last_event: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
     assert_eq!(last_event["current"], 1);
+    assert!(last_event.get("current_artist").is_none());
     assert!(last_event["retained_lastfm_bytes"].as_u64().unwrap() > 1);
     let graph = bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
     assert_eq!(graph.statistics().unwrap().artist_observations, 1);

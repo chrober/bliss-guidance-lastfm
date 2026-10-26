@@ -194,6 +194,16 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                 etag: value.etag.clone(),
                 last_modified: value.last_modified.clone(),
             });
+            progress.current_artist = Some(root.name.clone());
+            progress.database_bytes = database_bytes(&request.store_path);
+            progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+            progress.message = format!(
+                "Fetching similar artists for {} ({}/{})",
+                root.name,
+                index + 1,
+                total
+            );
+            emit_json(output, &progress)?;
             let mut attempt = 0_u32;
             let response = loop {
                 progress.requests += 1;
@@ -251,6 +261,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
             )? {
                 progress.changed += 1;
             }
+            progress.current_artist = None;
             progress.current = index as u64 + 1;
             if retained_storage_bytes(&store, request)?
                 >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
@@ -275,6 +286,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         emit_json(output, &progress)?;
     }
     progress.finished = true;
+    progress.current_artist = None;
     progress.message = "Last.fm graph update completed".to_owned();
     emit_json(output, &progress)
 }
