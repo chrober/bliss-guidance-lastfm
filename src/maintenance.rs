@@ -126,6 +126,12 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     let storage_scope = request.storage_scope()?;
     let now = unix_seconds();
     let mut store = GraphStore::open_at(&request.store_path, now)?;
+    let total = snapshot.artists.len() as u64;
+    let mut progress = GraphProgress::new("sync", "Preparing offline Last.fm update");
+    progress.message = format!("Preparing {total} library artists for offline Last.fm update");
+    progress.total = total;
+    progress.database_bytes = database_bytes(&request.store_path);
+    emit_json(output, &progress)?;
     let mut artist_ids = Vec::with_capacity(snapshot.artists.len());
     for root in &snapshot.artists {
         artist_ids.push(store.resolve_or_create_artist(
@@ -143,9 +149,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         &artist_ids,
     )?;
 
-    let total = snapshot.artists.len() as u64;
-    let mut progress = GraphProgress::new("sync", "Updating offline Last.fm artist graph");
-    progress.total = total;
+    progress.message = format!("Prepared {total} library artists; starting Last.fm update");
     progress.database_bytes = database_bytes(&request.store_path);
     emit_json(output, &progress)?;
     let client = LastFmClient::new(endpoint, &api_key, Duration::from_secs(30))?;

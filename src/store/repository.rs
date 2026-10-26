@@ -297,7 +297,7 @@ impl GraphStore {
         for artist_id in artist_ids {
             transaction
                 .execute(
-                    "INSERT INTO library_artist_membership(snapshot_id, artist_id) VALUES (?1, ?2)",
+                    "INSERT OR IGNORE INTO library_artist_membership(snapshot_id, artist_id) VALUES (?1, ?2)",
                     params![snapshot_id, artist_id],
                 )
                 .map_err(|error| format!("cannot store Last.fm library artist: {error}"))?;

@@ -127,6 +127,13 @@ fn sync_emits_versioned_progress_and_persists_one_root() {
     let events = String::from_utf8(output.stdout).unwrap();
     assert!(events.contains("lastfm_graph_progress_v1"));
     assert!(events.contains("\"finished\":true"));
+    let first_event: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
+    assert_eq!(first_event["current"], 0);
+    assert_eq!(first_event["total"], 1);
+    assert!(first_event["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("Preparing 1 library artists"));
     let graph = bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
     assert_eq!(graph.statistics().unwrap().artist_observations, 1);
     assert_eq!(graph.statistics().unwrap().artist_edges, 1);

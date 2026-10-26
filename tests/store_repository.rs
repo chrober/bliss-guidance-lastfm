@@ -200,6 +200,36 @@ fn reports_whether_an_artist_belongs_to_the_latest_library_snapshot() {
 }
 
 #[test]
+fn library_membership_tolerates_duplicate_canonical_artist_ids() {
+    let path = database_path("duplicate-membership");
+    let mut store = GraphStore::open(&path).unwrap();
+    let member = store
+        .upsert_artist(
+            Some("11111111-1111-1111-1111-111111111111"),
+            "Canonical Artist",
+            1_700_000_000,
+        )
+        .unwrap();
+
+    store
+        .replace_library_membership("snapshot-1", "library-1", 1_700_000_000, &[member, member])
+        .unwrap();
+
+    drop(store);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    let memberships: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM library_artist_membership",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(memberships, 1);
+    drop(connection);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn compaction_applies_the_current_result_limit_and_local_artist_scope() {
     let path = database_path("compact-scope");
     let mut store = GraphStore::open(&path).unwrap();
