@@ -34,6 +34,24 @@ fn serve_once(response: &'static str) -> (String, thread::JoinHandle<String>) {
 }
 
 #[test]
+fn failures_expose_safe_http_and_parse_context_without_credentials() {
+    for (response, expected) in [
+        ("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 60\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", "HTTP status 429; retryable=yes; retry-after=60s"),
+        ("HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json", "stage=json_decode; retryable=no"),
+        ("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}", "stage=result_shape; retryable=no"),
+        ("HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\n{\"error\":10}", "Last.fm error code 10; retryable=no"),
+    ] {
+        let (endpoint, server) = serve_once(response);
+        let client = LastFmClient::new(&endpoint, "secret-fixture-key", Duration::from_secs(2)).unwrap();
+        let error = client.similar_artists("Source", None, ArtistLimit::TwentyFive, None).unwrap_err();
+        let detail = error.diagnostic();
+        assert!(detail.contains(expected), "{detail}");
+        assert!(!detail.contains("secret-fixture-key"));
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn artist_response_captures_limit_validators_and_freshness_headers() {
     let body =
         r#"{"similarartists":{"artist":[{"name":"Target","mbid":"target-mbid","match":"0.75"}]}}"#;
@@ -140,6 +158,38 @@ fn freshness_prefers_http_metadata_and_has_bounded_fallbacks() {
         expires_at(now, None, None, FreshnessClass::Track),
         now + 86_400
     );
+}
+
+#[test]
+fn configured_refresh_targets_use_last_validation_and_override_automatic_expiry() {
+    use bliss_guidance_lastfm::freshness::artist_observation_is_fresh;
+    let now = 1_700_000_000;
+    let validated = now - 10 * 86_400;
+    assert!(artist_observation_is_fresh(
+        now,
+        validated,
+        now + 86_400,
+        None
+    ));
+    assert!(!artist_observation_is_fresh(now, validated, now - 1, None));
+    assert!(!artist_observation_is_fresh(
+        now,
+        validated,
+        now + 86_400,
+        Some(7)
+    ));
+    assert!(artist_observation_is_fresh(
+        now,
+        validated,
+        now - 1,
+        Some(30)
+    ));
+    assert!(!artist_observation_is_fresh(
+        now,
+        validated,
+        now + 86_400,
+        Some(10)
+    ));
 }
 
 #[test]

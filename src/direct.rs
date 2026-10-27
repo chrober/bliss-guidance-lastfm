@@ -1,4 +1,6 @@
-use crate::freshness::{canonical_artist_payload_hash, expires_at, FreshnessClass};
+use crate::freshness::{
+    artist_observation_is_fresh, canonical_artist_payload_hash, expires_at, FreshnessClass,
+};
 use crate::lastfm_api::{
     ArtistLimit, LastFmClient, LastFmError, ResponseEnvelope, ResponseStatus, SimilarArtist,
     SimilarTrack, Validators,
@@ -41,7 +43,19 @@ fn push_log_event(
     details: Option<Value>,
 ) {
     if events.len() >= MAX_LOG_EVENTS {
-        return;
+        if matches!(level, "warning" | "error") {
+            if let Some(index) = events
+                .iter()
+                .position(|value| value["level"] == "debug")
+                .or_else(|| events.iter().position(|value| value["level"] == "info"))
+            {
+                events.remove(index);
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
     }
     events.push(serde_json::json!({
         "event_version": "guidance_log_event_v1",
@@ -68,6 +82,8 @@ pub struct DirectOptions {
     pub request_deadline_ms: u64,
     pub max_concurrent_requests: usize,
     pub budget_bytes: u64,
+    pub artist_refresh_days: Option<u32>,
+    pub empty_artist_refresh_days: Option<u32>,
     pub diagnostic_level: String,
 }
 
@@ -158,6 +174,8 @@ impl DirectOptions {
             request_deadline_ms,
             max_concurrent_requests: max_concurrent_requests as usize,
             budget_bytes,
+            artist_refresh_days: optional_refresh_days(object, "artist_refresh_days")?,
+            empty_artist_refresh_days: optional_refresh_days(object, "empty_artist_refresh_days")?,
             diagnostic_level,
         })
     }
@@ -466,10 +484,18 @@ impl DirectPrepared {
                     .artist_result_limit
                     .is_satisfied_by(value.requested_limit)
             });
-            let fresh = existing
-                .as_ref()
-                .is_some_and(|value| value.expires_at > now)
-                && complete;
+            let fresh = existing.as_ref().is_some_and(|value| {
+                artist_observation_is_fresh(
+                    now,
+                    value.validated_at,
+                    value.expires_at,
+                    if value.result_status == ObservationStatus::Empty {
+                        options.empty_artist_refresh_days
+                    } else {
+                        options.artist_refresh_days
+                    },
+                )
+            }) && complete;
             let use_stored = fresh
                 || matches!(
                     options.retrieval_policy,
@@ -836,7 +862,14 @@ fn persist_response(
             },
             FetchResponse::Artist(response),
         ) => {
-            let class = if response.results.is_empty() {
+            let empty = if response.status == ResponseStatus::NotModified {
+                existing
+                    .as_ref()
+                    .is_some_and(|value| value.result_status == ObservationStatus::Empty)
+            } else {
+                response.results.is_empty()
+            };
+            let class = if empty {
                 FreshnessClass::ArtistEmpty
             } else {
                 FreshnessClass::ArtistPositive
@@ -1131,7 +1164,7 @@ fn fetch_with_retry(
                 let remaining = remaining_duration(deadline)?;
                 thread::sleep(delay.min(remaining));
             }
-            Err(error) => return Err(error.message().to_owned()),
+            Err(error) => return Err(error.diagnostic()),
         }
     }
     Err("direct Last.fm request is temporarily unavailable".to_owned())
@@ -1172,4 +1205,44 @@ fn integer_option(
         .filter(|value| *value >= minimum && *value <= maximum)
         .ok_or_else(|| format!("direct Last.fm option '{key}' is invalid"))?;
     Ok(value)
+}
+
+fn optional_refresh_days(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<u32>, String> {
+    match object.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .filter(|value| *value > 0)
+            .and_then(|value| u32::try_from(value).ok())
+            .map(Some)
+            .ok_or_else(|| format!("direct Last.fm option '{key}' is invalid")),
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+
+    #[test]
+    fn warning_survives_when_info_events_fill_the_diagnostic_budget() {
+        let mut events = Vec::new();
+        for _ in 0..MAX_LOG_EVENTS {
+            push_log_event(&mut events, "info", "routine", None, None, None, None, None);
+        }
+        push_log_event(
+            &mut events,
+            "warning",
+            "failure",
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(events.len(), MAX_LOG_EVENTS);
+        assert!(events.iter().any(|event| event["event"] == "failure"));
+    }
 }

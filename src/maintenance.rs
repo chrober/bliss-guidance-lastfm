@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use crate::direct::{persist_artist_response, StorageScope, API_KEY_ENVIRONMENT};
+use crate::freshness::artist_observation_is_fresh;
 use crate::lastfm_api::{ArtistLimit, LastFmClient, Validators};
 use crate::progress::GraphProgress;
 use crate::root_snapshot::LibraryArtistSnapshot;
-use crate::store::{ArtistIdentity, GraphStore};
+use crate::store::{ArtistIdentity, GraphStore, ObservationStatus};
 use serde::Deserialize;
 use serde_json::json;
 use std::io::Write;
@@ -25,6 +26,8 @@ pub struct GraphRequest {
     pub confirmed: Option<bool>,
     pub budget_bytes: Option<u64>,
     pub storage_scope: Option<String>,
+    pub artist_refresh_days: Option<u32>,
+    pub empty_artist_refresh_days: Option<u32>,
 }
 
 impl GraphRequest {
@@ -112,6 +115,9 @@ fn status(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
 }
 
 fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
+    if request.artist_refresh_days == Some(0) || request.empty_artist_refresh_days == Some(0) {
+        return Err("Last.fm artist refresh intervals must be positive".to_owned());
+    }
     let api_key = request.require_api_key()?;
     let roots_path = request
         .roots_path
@@ -173,7 +179,16 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         let source_id = store.resolve_or_create_artist(&identity, now)?;
         let stored = store.artist_observation(source_id)?;
         let sufficient = stored.as_ref().is_some_and(|value| {
-            value.expires_at > now && limit.is_satisfied_by(value.requested_limit)
+            artist_observation_is_fresh(
+                now,
+                value.validated_at,
+                value.expires_at,
+                if value.result_status == ObservationStatus::Empty {
+                    request.empty_artist_refresh_days
+                } else {
+                    request.artist_refresh_days
+                },
+            ) && limit.is_satisfied_by(value.requested_limit)
         });
         if sufficient {
             progress.cached += 1;
@@ -223,8 +238,13 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                             progress.retry_at = Some(
                                 unix_seconds() + error.retry_after_seconds().unwrap_or(60) as i64,
                             );
-                            progress.message =
-                                "Last.fm graph update paused after rate limiting".to_owned();
+                            progress.message = format!(
+                                "Last.fm graph update paused for {} ({}/{}): {}",
+                                root.name,
+                                index + 1,
+                                total,
+                                error.diagnostic()
+                            );
                             emit_json(output, &progress)?;
                             return Ok(());
                         }
@@ -237,15 +257,25 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                         progress.finished = true;
                         progress.retry_at =
                             Some(unix_seconds() + error.retry_after_seconds().unwrap_or(60) as i64);
-                        progress.message =
-                            "Last.fm graph update paused after a temporary request failure"
-                                .to_owned();
+                        progress.message = format!(
+                            "Last.fm graph update paused for {} ({}/{}): {}",
+                            root.name,
+                            index + 1,
+                            total,
+                            error.diagnostic()
+                        );
                         emit_json(output, &progress)?;
                         return Ok(());
                     }
                     Err(error) => {
                         progress.failures += 1;
-                        return Err(error.message().to_owned());
+                        return Err(format!(
+                            "artist.getSimilar for {} ({}/{}): {}",
+                            root.name,
+                            index + 1,
+                            total,
+                            error.diagnostic()
+                        ));
                     }
                 }
             };

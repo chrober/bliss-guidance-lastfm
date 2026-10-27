@@ -37,6 +37,124 @@ fn run(command: &str, request: &std::path::Path) -> std::process::Output {
 }
 
 #[test]
+fn sync_failure_identifies_artist_and_safe_parse_context() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0_u8; 8192];
+        let _ = stream.read(&mut buffer).unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+    });
+    let store = temp_path("failure-context", "sqlite");
+    let roots = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/library-artist-roots-v1.json");
+    let request_path = request(
+        &store,
+        serde_json::json!({
+            "acquisition_mode":"direct", "roots_path":roots, "api_endpoint":endpoint
+        }),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .args(["graph", "sync", "--request"])
+        .arg(&request_path)
+        .env("BLISS_GUIDANCE_LASTFM_API_KEY", "secret-test-key")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(!output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        output.contains("artist.getSimilar for Seed Artist (1/1)"),
+        "{output}"
+    );
+    assert!(output.contains("stage=result_shape"), "{output}");
+    assert!(!output.contains("secret-test-key"));
+    let _ = fs::remove_file(request_path);
+    let _ = fs::remove_file(store);
+}
+
+#[test]
+fn custom_empty_target_revalidates_a_fresh_cached_observation_conditionally() {
+    use bliss_guidance_lastfm::store::{ArtistObservationWrite, GraphStore, ObservationStatus};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
+    let store_path = temp_path("target-revalidate", "sqlite");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut store = GraphStore::open(&store_path).unwrap();
+    let id = store
+        .upsert_artist(Some("seed-artist-mbid"), "Seed Artist", now)
+        .unwrap();
+    store
+        .replace_artist_observation(
+            id,
+            &ArtistObservationWrite {
+                fetched_at: now - 10 * 86400,
+                validated_at: now - 10 * 86400,
+                changed_at: now - 10 * 86400,
+                expires_at: now + 30 * 86400,
+                etag: Some("\"fixture-etag\"".to_owned()),
+                last_modified: None,
+                payload_hash: "fixture".to_owned(),
+                acquisition_source: "api_key".to_owned(),
+                requested_limit: 25,
+                actual_result_count: 0,
+                result_status: ObservationStatus::Empty,
+            },
+            &[],
+        )
+        .unwrap();
+    drop(store);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0_u8; 8192];
+        let n = stream.read(&mut buffer).unwrap();
+        let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+        assert!(
+            request.contains("if-none-match: \"fixture-etag\""),
+            "{request}"
+        );
+        stream.write_all(b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let roots = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/library-artist-roots-v1.json");
+    let request_path = request(
+        &store_path,
+        serde_json::json!({"acquisition_mode":"direct", "roots_path":roots, "api_endpoint":endpoint, "empty_artist_refresh_days":7}),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .args(["graph", "sync", "--request"])
+        .arg(&request_path)
+        .env("BLISS_GUIDANCE_LASTFM_API_KEY", "fixture-key")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let store = GraphStore::open(&store_path).unwrap();
+    let observation = store.artist_observation(id).unwrap().unwrap();
+    assert!(observation.validated_at >= now);
+    assert_eq!(observation.result_status, ObservationStatus::Empty);
+    drop(store);
+    let _ = fs::remove_file(request_path);
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
 fn status_is_read_only_and_reports_a_missing_or_available_graph() {
     let store = temp_path("status", "sqlite");
     let legacy_cache = temp_path("legacy-status", "json");

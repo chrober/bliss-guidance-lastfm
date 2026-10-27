@@ -20,7 +20,7 @@ const PROGRAM: &str = env!("CARGO_PKG_NAME");
 fn version_metadata_json() -> String {
     let graph_schema = bliss_guidance_lastfm::store::SCHEMA_VERSION;
     format!(
-        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{PROVIDER_VERSION}\",\"provider_id\":\"{PROVIDER_ID}\",\"spi_version\":{SPI_VERSION},\"acquisition_modes\":[\"artifact\",\"direct\"],\"offline_graph_schema_version\":{graph_schema},\"graph_commands\":[\"status\",\"sync\",\"compact\",\"delete\"],\"channel_policies\":{{\"lastfm_track\":[\"bounded_influence\"],\"lastfm_artist\":[\"bounded_influence\",\"target_share\"]}}}}"
+        "{{\"schema_version\":1,\"program\":\"{PROGRAM}\",\"version\":\"{PROVIDER_VERSION}\",\"provider_id\":\"{PROVIDER_ID}\",\"spi_version\":{SPI_VERSION},\"acquisition_modes\":[\"artifact\",\"direct\"],\"offline_graph_schema_version\":{graph_schema},\"artist_refresh_targets\":true,\"graph_commands\":[\"status\",\"sync\",\"compact\",\"delete\"],\"channel_policies\":{{\"lastfm_track\":[\"bounded_influence\"],\"lastfm_artist\":[\"bounded_influence\",\"target_share\"]}}}}"
     )
 }
 
@@ -120,6 +120,8 @@ impl Provider {
                     "legacy_cache_path": {"type": "string"},
                     "retrieval_policy": {"enum": ["online_with_cache", "offline_preferred", "offline_only"]},
                     "artist_result_limit": {"type": "integer", "minimum": 0},
+                    "artist_refresh_days": {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
+                    "empty_artist_refresh_days": {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
                     "budget_bytes": {"type": "integer", "minimum": 1},
                     "storage_scope": {"enum": ["all_returned_artists", "local_artists_only"]},
                     "request_deadline_ms": {"type": "integer", "minimum": 100, "maximum": 60000},

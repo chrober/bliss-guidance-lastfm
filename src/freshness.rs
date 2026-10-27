@@ -14,6 +14,18 @@ pub enum FreshnessClass {
     Track,
 }
 
+pub fn artist_observation_is_fresh(
+    now: i64,
+    validated_at: i64,
+    expires_at: i64,
+    refresh_days: Option<u32>,
+) -> bool {
+    match refresh_days {
+        Some(days) => validated_at.saturating_add(i64::from(days) * 86_400) > now,
+        None => expires_at > now,
+    }
+}
+
 pub fn expires_at(
     now: i64,
     cache_control: Option<&str>,

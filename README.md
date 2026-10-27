@@ -127,6 +127,11 @@ per second, persists each complete response, and emits
 retained-Last.fm-data budget leave already committed roots resumable. The budget
 defaults to 100 decimal MB. Last.fm's [API terms](https://www.last.fm/api/tos)
 require prior written consent to exceed its 100 MB reasonable-usage cap.
+Optional positive `artist_refresh_days` and `empty_artist_refresh_days` set
+refresh targets relative to the last validation for both graph sync and direct
+guidance. When omitted, Last.fm freshness headers or the 30/7-day fallbacks are
+used. Revalidation uses available validators; this does not schedule updates.
+The current implementation does not interpret every HTTP caching directive.
 The budget counts a deterministic canonical representation of stored Last.fm
 result identities, ranks, scores, and HTTP validators; it does not count
 SQLite pages, indexes, WAL, SHM, or Lyrion-owned identities. Physical SQLite

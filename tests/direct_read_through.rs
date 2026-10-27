@@ -153,3 +153,63 @@ fn offline_only_missing_data_is_neutral_and_makes_no_request() {
     let _ = std::fs::remove_file(&store);
     let _ = std::fs::remove_file(store.with_extension("json"));
 }
+
+#[test]
+fn custom_positive_target_revalidates_during_guidance_preparation() {
+    use bliss_guidance_lastfm::store::{ArtistObservationWrite, GraphStore, ObservationStatus};
+    let _guard = API_KEY_LOCK.lock().unwrap();
+    std::env::set_var(API_KEY_ENVIRONMENT, "test-key");
+    let store = store_path();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut graph = GraphStore::open(&store).unwrap();
+    let id = graph
+        .upsert_artist(Some("seed-artist"), "Seed Artist", now)
+        .unwrap();
+    graph
+        .replace_artist_observation(
+            id,
+            &ArtistObservationWrite {
+                fetched_at: now - 40 * 86400,
+                validated_at: now - 40 * 86400,
+                changed_at: now - 40 * 86400,
+                expires_at: now + 30 * 86400,
+                etag: Some("\"seed-etag\"".to_owned()),
+                last_modified: None,
+                payload_hash: "fixture".to_owned(),
+                acquisition_source: "api_key".to_owned(),
+                requested_limit: 25,
+                actual_result_count: 1,
+                result_status: ObservationStatus::Positive,
+            },
+            &[],
+        )
+        .unwrap();
+    drop(graph);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buffer = [0_u8; 8192];
+        let n = stream.read(&mut buffer).unwrap();
+        let request = String::from_utf8_lossy(&buffer[..n]).to_ascii_lowercase();
+        assert!(request.contains("if-none-match: \"seed-etag\""));
+        stream.write_all(b"HTTP/1.1 304 Not Modified\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n").unwrap();
+    });
+    let mut settings = options(&endpoint, &store, "online_with_cache");
+    settings.artist_refresh_days = Some(30);
+    let mut seed = anchor();
+    seed.track.title = None;
+    seed.track.recording_mbid = None;
+    let (_, diagnostics) = DirectPrepared::prepare(&settings, &[seed]).unwrap();
+    server.join().unwrap();
+    assert_eq!(diagnostics.request_count, 1);
+    let graph = GraphStore::open(&store).unwrap();
+    assert!(graph.artist_observation(id).unwrap().unwrap().validated_at >= now);
+    drop(graph);
+    std::env::remove_var(API_KEY_ENVIRONMENT);
+    let _ = std::fs::remove_file(&store);
+    let _ = std::fs::remove_file(store.with_extension("json"));
+}
