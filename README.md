@@ -123,8 +123,10 @@ bliss-guidance-lastfm graph delete  --request request.json
 Lyrion contributor IDs, names, and available Artist MBIDs. It skips sufficient
 fresh observations, limits network traffic to one worker and at most one call
 per second, persists each complete response, and emits
-`lastfm_graph_progress_v1` JSONL. Cancellation, rate limiting, and the 80 MiB
-retained-Last.fm-data safety budget leave already committed roots resumable.
+`lastfm_graph_progress_v1` JSONL. Cancellation, rate limiting, and the configured
+retained-Last.fm-data budget leave already committed roots resumable. The budget
+defaults to 100 decimal MB. Last.fm's [API terms](https://www.last.fm/api/tos)
+require prior written consent to exceed its 100 MB reasonable-usage cap.
 The budget counts a deterministic canonical representation of stored Last.fm
 result identities, ranks, scores, and HTTP validators; it does not count
 SQLite pages, indexes, WAL, SHM, or Lyrion-owned identities. Physical SQLite

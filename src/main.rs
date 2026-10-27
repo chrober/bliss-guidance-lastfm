@@ -120,7 +120,7 @@ impl Provider {
                     "legacy_cache_path": {"type": "string"},
                     "retrieval_policy": {"enum": ["online_with_cache", "offline_preferred", "offline_only"]},
                     "artist_result_limit": {"type": "integer", "minimum": 0},
-                    "budget_bytes": {"type": "integer", "minimum": 1, "maximum": 100000000},
+                    "budget_bytes": {"type": "integer", "minimum": 1},
                     "storage_scope": {"enum": ["all_returned_artists", "local_artists_only"]},
                     "request_deadline_ms": {"type": "integer", "minimum": 100, "maximum": 60000},
                     "max_concurrent_requests": {"type": "integer", "minimum": 1, "maximum": 8},
@@ -747,6 +747,8 @@ mod tests {
         assert!(properties.contains_key("store_path"));
         assert!(properties.contains_key("retrieval_policy"));
         assert!(properties.contains_key("max_concurrent_requests"));
+        assert_eq!(properties["budget_bytes"]["minimum"], 1);
+        assert!(properties["budget_bytes"].get("maximum").is_none());
         assert!(!properties.contains_key("api_key"));
     }
 
