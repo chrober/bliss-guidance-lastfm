@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const DEFAULT_BUDGET_BYTES: u64 = 80 * 1024 * 1024;
+const DEFAULT_BUDGET_BYTES: u64 = 100_000_000;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct GraphRequest {
@@ -46,12 +46,9 @@ impl GraphRequest {
     }
 
     fn artist_limit(&self) -> Result<ArtistLimit, String> {
-        match self.artist_result_limit.unwrap_or(25) {
-            25 => Ok(ArtistLimit::TwentyFive),
-            50 => Ok(ArtistLimit::Fifty),
-            100 => Ok(ArtistLimit::OneHundred),
-            _ => Err("Last.fm graph artist result limit is invalid".to_owned()),
-        }
+        Ok(ArtistLimit::from_value(
+            self.artist_result_limit.unwrap_or(25),
+        ))
     }
 
     fn storage_scope(&self) -> Result<StorageScope, String> {
@@ -175,9 +172,9 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         };
         let source_id = store.resolve_or_create_artist(&identity, now)?;
         let stored = store.artist_observation(source_id)?;
-        let sufficient = stored
-            .as_ref()
-            .is_some_and(|value| value.expires_at > now && value.requested_limit >= limit.value());
+        let sufficient = stored.as_ref().is_some_and(|value| {
+            value.expires_at > now && limit.is_satisfied_by(value.requested_limit)
+        });
         if sufficient {
             progress.cached += 1;
         } else {
@@ -252,14 +249,27 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                     }
                 }
             };
-            if persist_artist_response(
+            let persisted = persist_artist_response(
                 &mut store,
                 &identity,
                 &response,
                 unix_seconds(),
                 storage_scope,
-            )? {
-                progress.changed += 1;
+                request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES),
+            )?;
+            match persisted {
+                Some(true) => progress.changed += 1,
+                Some(false) => {}
+                None => {
+                    progress.budget_exhausted = true;
+                    progress.finished = true;
+                    progress.current_artist = None;
+                    progress.database_bytes = database_bytes(&request.store_path);
+                    progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+                    progress.message = "Last.fm graph storage budget is exhausted".to_owned();
+                    emit_json(output, &progress)?;
+                    return Ok(());
+                }
             }
             progress.current_artist = None;
             progress.current = index as u64 + 1;

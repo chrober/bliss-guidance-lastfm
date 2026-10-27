@@ -67,6 +67,7 @@ pub struct DirectOptions {
     pub storage_scope: StorageScope,
     pub request_deadline_ms: u64,
     pub max_concurrent_requests: usize,
+    pub budget_bytes: u64,
     pub diagnostic_level: String,
 }
 
@@ -115,16 +116,13 @@ impl DirectOptions {
             "offline_only" => RetrievalPolicy::OfflineOnly,
             _ => return Err("direct Last.fm retrieval policy is invalid".to_owned()),
         };
-        let artist_result_limit = match object
+        let artist_result_limit = object
             .get("artist_result_limit")
             .and_then(Value::as_u64)
             .unwrap_or(25)
-        {
-            25 => ArtistLimit::TwentyFive,
-            50 => ArtistLimit::Fifty,
-            100 => ArtistLimit::OneHundred,
-            _ => return Err("direct Last.fm artist result limit is invalid".to_owned()),
-        };
+            .try_into()
+            .map(ArtistLimit::from_value)
+            .map_err(|_| "direct Last.fm artist result limit is invalid".to_owned())?;
         let storage_scope = match object
             .get("storage_scope")
             .and_then(Value::as_str)
@@ -136,6 +134,10 @@ impl DirectOptions {
         };
         let request_deadline_ms = integer_option(object, "request_deadline_ms", 100, 60_000)?;
         let max_concurrent_requests = integer_option(object, "max_concurrent_requests", 1, 8)?;
+        let budget_bytes = object
+            .get("budget_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(100_000_000);
         let diagnostic_level = object
             .get("diagnostic_level")
             .and_then(Value::as_str)
@@ -155,6 +157,7 @@ impl DirectOptions {
             storage_scope,
             request_deadline_ms,
             max_concurrent_requests: max_concurrent_requests as usize,
+            budget_bytes,
             diagnostic_level,
         })
     }
@@ -458,9 +461,11 @@ impl DirectPrepared {
                 artist_mbid: mbid.clone(),
                 existing: existing.clone(),
             };
-            let complete = existing
-                .as_ref()
-                .is_some_and(|value| value.requested_limit >= options.artist_result_limit.value());
+            let complete = existing.as_ref().is_some_and(|value| {
+                options
+                    .artist_result_limit
+                    .is_satisfied_by(value.requested_limit)
+            });
             let fresh = existing
                 .as_ref()
                 .is_some_and(|value| value.expires_at > now)
@@ -581,11 +586,31 @@ impl DirectPrepared {
                     Some(serde_json::json!({"results": debug_results})),
                 );
             }
-            if matches!(response, FetchResponse::Artist(_))
-                && persist_response(&mut store, &task, &response, now, options.storage_scope)
-                    .is_err()
-            {
-                persistence_failed += 1;
+            if matches!(response, FetchResponse::Artist(_)) {
+                match persist_response(
+                    &mut store,
+                    &task,
+                    &response,
+                    now,
+                    options.storage_scope,
+                    Some(options.budget_bytes),
+                ) {
+                    Err(_) => persistence_failed += 1,
+                    Ok(true) => {}
+                    Ok(false) if wants_info(&options.diagnostic_level) => {
+                        push_log_event(
+                            &mut log_events,
+                            "info",
+                            "lastfm_persistence_skipped",
+                            Some(task.operation()),
+                            Some(task.source()),
+                            Some("budget_exhausted"),
+                            Some(result_count),
+                            Some(serde_json::json!({"budget_bytes": options.budget_bytes})),
+                        );
+                    }
+                    Ok(false) => {}
+                }
             }
             match response {
                 FetchResponse::Track(value) => {
@@ -771,10 +796,15 @@ fn stored_artists(
     observation: &ArtistObservationRecord,
     limit: u32,
 ) -> Result<Vec<SimilarArtist>, String> {
+    let take = if limit == 0 {
+        usize::MAX
+    } else {
+        limit as usize
+    };
     observation
         .edges
         .iter()
-        .take(limit as usize)
+        .take(take)
         .map(|edge| {
             let target = store
                 .artist(edge.target_artist_id)?
@@ -794,7 +824,8 @@ fn persist_response(
     response: &FetchResponse,
     now: i64,
     storage_scope: StorageScope,
-) -> Result<(), String> {
+    budget_bytes: Option<u64>,
+) -> Result<bool, String> {
     match (task, response) {
         (
             FetchTask::Artist {
@@ -817,10 +848,11 @@ fn persist_response(
                 class,
             );
             if response.status == ResponseStatus::NotModified {
-                return store.revalidate_artist_observation(
+                store.revalidate_artist_observation(
                     *source_id,
                     &validation(response, None, now, expiry),
-                );
+                )?;
+                return Ok(true);
             }
             let hash_rows = response
                 .results
@@ -840,10 +872,11 @@ fn persist_response(
                 .as_ref()
                 .is_some_and(|value| value.payload_hash == hash)
             {
-                return store.revalidate_artist_observation(
+                store.revalidate_artist_observation(
                     *source_id,
                     &validation(response, Some(response.requested_limit), now, expiry),
-                );
+                )?;
+                return Ok(true);
             }
             let mut edges = Vec::with_capacity(response.results.len());
             for (index, target) in response.results.iter().enumerate() {
@@ -871,13 +904,23 @@ fn persist_response(
                     match_score: target.score,
                 });
             }
-            store.replace_artist_observation(
-                *source_id,
-                &observation_write(response, hash, now, expiry),
-                &edges,
-            )
+            if let Some(budget_bytes) = budget_bytes {
+                store.replace_artist_observation_with_budget(
+                    *source_id,
+                    &observation_write(response, hash, now, expiry),
+                    &edges,
+                    budget_bytes,
+                )
+            } else {
+                store.replace_artist_observation(
+                    *source_id,
+                    &observation_write(response, hash, now, expiry),
+                    &edges,
+                )?;
+                Ok(true)
+            }
         }
-        (FetchTask::Track { .. }, FetchResponse::Track(_)) => Ok(()),
+        (FetchTask::Track { .. }, FetchResponse::Track(_)) => Ok(true),
         _ => Err("Last.fm fetch task and response do not match".to_owned()),
     }
 }
@@ -888,7 +931,8 @@ pub(crate) fn persist_artist_response(
     response: &ResponseEnvelope<SimilarArtist>,
     now: i64,
     storage_scope: StorageScope,
-) -> Result<bool, String> {
+    budget_bytes: u64,
+) -> Result<Option<bool>, String> {
     let source_id = store.resolve_or_create_artist(source, now)?;
     let existing = store.artist_observation(source_id)?;
     let old_hash = existing.as_ref().map(|value| value.payload_hash.clone());
@@ -899,17 +943,21 @@ pub(crate) fn persist_artist_response(
         artist_mbid: source.mbid.clone(),
         existing,
     };
-    persist_response(
+    let stored = persist_response(
         store,
         &task,
         &FetchResponse::Artist(response.clone()),
         now,
         storage_scope,
+        Some(budget_bytes),
     )?;
+    if !stored {
+        return Ok(None);
+    }
     let new_hash = store
         .artist_observation(source_id)?
         .map(|value| value.payload_hash);
-    Ok(old_hash != new_hash)
+    Ok(Some(old_hash != new_hash))
 }
 
 fn validation<T>(

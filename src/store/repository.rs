@@ -4,7 +4,7 @@ use super::schema;
 use super::{normalize_name, ArtistIdentity};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -289,12 +289,14 @@ impl GraphStore {
         let transaction = self.connection.transaction().map_err(|error| {
             format!("cannot start Last.fm graph compaction transaction: {error}")
         })?;
-        transaction
-            .execute(
-                "DELETE FROM artist_similarity_edges WHERE rank > ?1",
-                [artist_result_limit],
-            )
-            .map_err(|error| format!("cannot trim Last.fm artist edges: {error}"))?;
+        if artist_result_limit > 0 {
+            transaction
+                .execute(
+                    "DELETE FROM artist_similarity_edges WHERE rank > ?1",
+                    [artist_result_limit],
+                )
+                .map_err(|error| format!("cannot trim Last.fm artist edges: {error}"))?;
+        }
         if local_artists_only {
             transaction
                 .execute(
@@ -531,14 +533,30 @@ impl GraphStore {
         observation: &ArtistObservationWrite,
         edges: &[ArtistEdgeWrite],
     ) -> Result<(), String> {
+        self.replace_artist_observation_with_budget(source_artist_id, observation, edges, u64::MAX)?
+            .then_some(())
+            .ok_or_else(|| "Last.fm retained-data budget is exhausted".to_owned())
+    }
+
+    pub fn replace_artist_observation_with_budget(
+        &mut self,
+        source_artist_id: i64,
+        observation: &ArtistObservationWrite,
+        edges: &[ArtistEdgeWrite],
+        budget_bytes: u64,
+    ) -> Result<bool, String> {
         let transaction = self
             .connection
             .transaction()
             .map_err(|error| format!("cannot start Last.fm graph transaction: {error}"))?;
         replace_artist_observation_on(&transaction, source_artist_id, observation, edges)?;
+        if retained_lastfm_bytes_on(&transaction)? > budget_bytes {
+            return Ok(false);
+        }
         transaction
             .commit()
-            .map_err(|error| format!("cannot commit Last.fm artist observation: {error}"))
+            .map_err(|error| format!("cannot commit Last.fm artist observation: {error}"))?;
+        Ok(true)
     }
 
     pub fn revalidate_artist_observation(
@@ -727,6 +745,17 @@ impl GraphStore {
     }
 }
 
+fn retained_lastfm_bytes_on(connection: &Connection) -> Result<u64, String> {
+    connection
+        .query_row(
+            "SELECT COALESCE(SUM(retained_payload_bytes), 0) FROM artist_queries",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value.max(0) as u64)
+        .map_err(|error| format!("cannot query retained Last.fm data size: {error}"))
+}
+
 fn resolve_or_create_artist_on(
     connection: &Connection,
     identity: &ArtistIdentity,
@@ -858,7 +887,13 @@ fn replace_artist_observation_on(
             [query_id],
         )
         .map_err(|error| format!("cannot replace Last.fm artist similarity edges: {error}"))?;
-    for edge in edges {
+    let mut ordered_edges = edges.iter().collect::<Vec<_>>();
+    ordered_edges.sort_by_key(|edge| edge.rank);
+    let mut seen_targets = HashSet::new();
+    for edge in ordered_edges {
+        if !seen_targets.insert(edge.target_artist_id) {
+            continue;
+        }
         connection
             .execute(
                 "INSERT INTO artist_similarity_edges(query_id, target_artist_id, rank, match_score) VALUES (?1, ?2, ?3, ?4)",

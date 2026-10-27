@@ -67,6 +67,32 @@ fn artist_response_captures_limit_validators_and_freshness_headers() {
 }
 
 #[test]
+fn artist_response_accepts_custom_limits_and_omits_limit_when_unlimited() {
+    let body = r#"{"similarartists":{"artist":[]}}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let leaked: &'static str = Box::leak(response.clone().into_boxed_str());
+    let (endpoint, server) = serve_once(leaked);
+    let client = LastFmClient::new(&endpoint, "test-key", Duration::from_secs(2)).unwrap();
+    let result = client
+        .similar_artists("Source", None, ArtistLimit::Custom(37), None)
+        .unwrap();
+    assert_eq!(result.requested_limit, 37);
+    assert!(server.join().unwrap().contains("limit=37"));
+
+    let leaked: &'static str = Box::leak(response.into_boxed_str());
+    let (endpoint, server) = serve_once(leaked);
+    let client = LastFmClient::new(&endpoint, "test-key", Duration::from_secs(2)).unwrap();
+    let result = client
+        .similar_artists("Source", None, ArtistLimit::Unlimited, None)
+        .unwrap();
+    assert_eq!(result.requested_limit, 0);
+    assert!(!server.join().unwrap().contains("limit="));
+}
+
+#[test]
 fn conditional_request_accepts_not_modified_without_parsing_a_body() {
     let (endpoint, server) = serve_once(
         "HTTP/1.1 304 Not Modified\r\nETag: \"artist-v1\"\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n",

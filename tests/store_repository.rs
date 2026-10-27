@@ -114,6 +114,92 @@ fn accounts_only_the_canonical_lastfm_payload_retained_by_an_observation() {
 }
 
 #[test]
+fn duplicate_resolved_targets_keep_the_best_rank() {
+    let path = database_path("duplicate-target");
+    let mut store = GraphStore::open(&path).unwrap();
+    let source = store.upsert_artist(None, "Source", 1_700_000_000).unwrap();
+    let target = store.upsert_artist(None, "Target", 1_700_000_000).unwrap();
+
+    store
+        .replace_artist_observation(
+            source,
+            &observation("duplicate-target", ObservationStatus::Positive),
+            &[
+                ArtistEdgeWrite {
+                    target_artist_id: target,
+                    rank: 3,
+                    match_score: Some(0.42),
+                },
+                ArtistEdgeWrite {
+                    target_artist_id: target,
+                    rank: 1,
+                    match_score: Some(0.91),
+                },
+            ],
+        )
+        .unwrap();
+
+    let stored = store.artist_observation(source).unwrap().unwrap();
+    assert_eq!(stored.edges.len(), 1);
+    assert_eq!(stored.edges[0].target_artist_id, target);
+    assert_eq!(stored.edges[0].rank, 1);
+    assert_eq!(stored.edges[0].match_score, Some(0.91));
+
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn retained_data_budget_rolls_back_an_oversized_replacement() {
+    let path = database_path("retained-budget");
+    let mut store = GraphStore::open(&path).unwrap();
+    let source = store.upsert_artist(None, "Source", 1_700_000_000).unwrap();
+    let first = store.upsert_artist(None, "First", 1_700_000_000).unwrap();
+    let second = store.upsert_artist(None, "Second", 1_700_000_000).unwrap();
+    store
+        .replace_artist_observation(
+            source,
+            &observation("original", ObservationStatus::Positive),
+            &[ArtistEdgeWrite {
+                target_artist_id: first,
+                rank: 1,
+                match_score: Some(0.9),
+            }],
+        )
+        .unwrap();
+    let budget = store.retained_lastfm_bytes().unwrap();
+
+    let stored = store
+        .replace_artist_observation_with_budget(
+            source,
+            &observation("larger", ObservationStatus::Positive),
+            &[
+                ArtistEdgeWrite {
+                    target_artist_id: first,
+                    rank: 1,
+                    match_score: Some(0.9),
+                },
+                ArtistEdgeWrite {
+                    target_artist_id: second,
+                    rank: 2,
+                    match_score: Some(0.8),
+                },
+            ],
+            budget,
+        )
+        .unwrap();
+
+    assert!(!stored);
+    let observation = store.artist_observation(source).unwrap().unwrap();
+    assert_eq!(observation.payload_hash, "original");
+    assert_eq!(observation.edges.len(), 1);
+    assert_eq!(store.retained_lastfm_bytes().unwrap(), budget);
+
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn migrates_v1_observations_and_backfills_retained_lastfm_bytes() {
     let path = database_path("v1-retained-migration");
     let connection = rusqlite::Connection::open(&path).unwrap();

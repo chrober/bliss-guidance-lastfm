@@ -89,7 +89,7 @@ fn mutating_commands_require_api_key_mode_and_environment_except_confirmed_delet
 }
 
 #[test]
-fn sync_emits_versioned_progress_and_persists_one_root() {
+fn sync_emits_versioned_progress_and_strictly_respects_the_budget() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
@@ -152,18 +152,21 @@ fn sync_emits_versioned_progress_and_persists_one_root() {
         .collect();
     let fetching_event = parsed_events
         .iter()
-        .find(|event| event["current_artist"] == "Seed Artist")
-        .expect("sync progress identifies the artist currently being fetched");
+        .find(|event| {
+            event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Fetching similar artists for Seed Artist"))
+        })
+        .expect("sync progress names the artist currently being fetched in its status message");
     assert_eq!(fetching_event["current"], 0);
     assert_eq!(fetching_event["retained_lastfm_bytes"], 0);
     let last_event: Value = serde_json::from_str(events.lines().last().unwrap()).unwrap();
-    assert_eq!(last_event["current"], 1);
-    assert!(last_event.get("current_artist").is_none());
-    assert!(last_event["retained_lastfm_bytes"].as_u64().unwrap() > 1);
+    assert_eq!(last_event["current"], 0);
+    assert_eq!(last_event["retained_lastfm_bytes"], 0);
     let graph = bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
-    assert_eq!(graph.statistics().unwrap().artist_observations, 1);
-    assert_eq!(graph.statistics().unwrap().artist_edges, 1);
-    assert!(graph.retained_lastfm_bytes().unwrap() > 1);
+    assert_eq!(graph.statistics().unwrap().artist_observations, 0);
+    assert_eq!(graph.statistics().unwrap().artist_edges, 0);
+    assert_eq!(graph.retained_lastfm_bytes().unwrap(), 0);
     drop(graph);
     let _ = fs::remove_file(request_path);
     let _ = fs::remove_file(store);

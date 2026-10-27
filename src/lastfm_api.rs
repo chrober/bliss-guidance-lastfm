@@ -4,17 +4,38 @@ use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArtistLimit {
+    Unlimited,
     TwentyFive,
     Fifty,
     OneHundred,
+    Custom(u32),
 }
 
 impl ArtistLimit {
     pub fn value(self) -> u32 {
         match self {
+            Self::Unlimited => 0,
             Self::TwentyFive => 25,
             Self::Fifty => 50,
             Self::OneHundred => 100,
+            Self::Custom(value) => value,
+        }
+    }
+
+    pub fn from_value(value: u32) -> Self {
+        match value {
+            0 => Self::Unlimited,
+            25 => Self::TwentyFive,
+            50 => Self::Fifty,
+            100 => Self::OneHundred,
+            value => Self::Custom(value),
+        }
+    }
+
+    pub fn is_satisfied_by(self, stored_limit: u32) -> bool {
+        match self {
+            Self::Unlimited => stored_limit == 0,
+            _ => stored_limit == 0 || stored_limit >= self.value(),
         }
     }
 }
@@ -162,8 +183,10 @@ impl LastFmClient {
         let mut request = self
             .base_request("artist.getSimilar")
             .query("artist", artist)
-            .query("autocorrect", "1")
-            .query("limit", &requested_limit.to_string());
+            .query("autocorrect", "1");
+        if requested_limit > 0 {
+            request = request.query("limit", &requested_limit.to_string());
+        }
         if let Some(mbid) = artist_mbid.filter(|value| !value.is_empty()) {
             request = request.query("mbid", mbid);
         }
