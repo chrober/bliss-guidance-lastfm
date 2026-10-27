@@ -83,6 +83,8 @@ pub fn run_graph_command(
 }
 
 fn status(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
+    let mut cache_usage =
+        crate::legacy_cache::CacheUsage::new(request.legacy_cache_path.as_deref());
     if !Path::new(&request.store_path).exists() {
         return emit_json(
             output,
@@ -90,7 +92,7 @@ fn status(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
                 "schema_version":1,
                 "state":"missing",
                 "database_bytes":0,
-                "retained_lastfm_bytes":legacy_cache_bytes(request),
+                "retained_lastfm_bytes":cache_usage.bytes(unix_seconds())?,
             }),
         );
     }
@@ -102,7 +104,7 @@ fn status(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
             "schema_version": 1,
             "state": "available",
             "database_bytes": database_bytes(&request.store_path),
-            "retained_lastfm_bytes": retained_storage_bytes(&store, request)?,
+            "retained_lastfm_bytes": retained_storage_bytes(&store, &mut cache_usage)?,
             "artists": statistics.artists,
             "artist_observations": statistics.artist_observations,
             "artist_edges": statistics.artist_edges,
@@ -132,12 +134,14 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     let storage_scope = request.storage_scope()?;
     let now = unix_seconds();
     let mut store = GraphStore::open_at(&request.store_path, now)?;
+    let mut cache_usage =
+        crate::legacy_cache::CacheUsage::new(request.legacy_cache_path.as_deref());
     let total = snapshot.artists.len() as u64;
     let mut progress = GraphProgress::new("sync", "Preparing offline Last.fm update");
     progress.message = format!("Preparing {total} library artists for offline Last.fm update");
     progress.total = total;
     progress.database_bytes = database_bytes(&request.store_path);
-    progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+    progress.retained_lastfm_bytes = retained_storage_bytes(&store, &mut cache_usage)?;
     emit_json(output, &progress)?;
     let mut artist_ids = Vec::with_capacity(snapshot.artists.len());
     for root in &snapshot.artists {
@@ -158,7 +162,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
 
     progress.message = format!("Prepared {total} library artists; starting Last.fm update");
     progress.database_bytes = database_bytes(&request.store_path);
-    progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+    progress.retained_lastfm_bytes = retained_storage_bytes(&store, &mut cache_usage)?;
     emit_json(output, &progress)?;
     let client = LastFmClient::new(endpoint, &api_key, Duration::from_secs(30))?;
     for (index, root) in snapshot.artists.iter().enumerate() {
@@ -193,7 +197,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         if sufficient {
             progress.cached += 1;
         } else {
-            if retained_storage_bytes(&store, request)?
+            if retained_storage_bytes(&store, &mut cache_usage)?
                 >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
             {
                 progress.budget_exhausted = true;
@@ -208,7 +212,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
             });
             progress.current_artist = Some(root.name.clone());
             progress.database_bytes = database_bytes(&request.store_path);
-            progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+            progress.retained_lastfm_bytes = retained_storage_bytes(&store, &mut cache_usage)?;
             progress.message = format!(
                 "Fetching similar artists for {} ({}/{})",
                 root.name,
@@ -288,7 +292,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                 request
                     .budget_bytes
                     .unwrap_or(DEFAULT_BUDGET_BYTES)
-                    .saturating_sub(legacy_cache_bytes(request)),
+                    .saturating_sub(cache_usage.bytes(unix_seconds())?),
             )?;
             match persisted {
                 Some(true) => progress.changed += 1,
@@ -298,7 +302,8 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                     progress.finished = true;
                     progress.current_artist = None;
                     progress.database_bytes = database_bytes(&request.store_path);
-                    progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+                    progress.retained_lastfm_bytes =
+                        retained_storage_bytes(&store, &mut cache_usage)?;
                     progress.message = "Last.fm graph storage budget is exhausted".to_owned();
                     emit_json(output, &progress)?;
                     return Ok(());
@@ -306,13 +311,13 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
             }
             progress.current_artist = None;
             progress.current = index as u64 + 1;
-            if retained_storage_bytes(&store, request)?
+            if retained_storage_bytes(&store, &mut cache_usage)?
                 >= request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES)
             {
                 progress.budget_exhausted = true;
                 progress.finished = true;
                 progress.database_bytes = database_bytes(&request.store_path);
-                progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+                progress.retained_lastfm_bytes = retained_storage_bytes(&store, &mut cache_usage)?;
                 progress.message =
                     "Last.fm graph storage budget was reached after the current artist".to_owned();
                 emit_json(output, &progress)?;
@@ -324,7 +329,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
         }
         progress.current = index as u64 + 1;
         progress.database_bytes = database_bytes(&request.store_path);
-        progress.retained_lastfm_bytes = retained_storage_bytes(&store, request)?;
+        progress.retained_lastfm_bytes = retained_storage_bytes(&store, &mut cache_usage)?;
         progress.message = format!("Updated {}/{} library artists", progress.current, total);
         emit_json(output, &progress)?;
     }
@@ -337,6 +342,8 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
 fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     request.require_api_key()?;
     let mut store = GraphStore::open(&request.store_path)?;
+    let mut cache_usage =
+        crate::legacy_cache::CacheUsage::new(request.legacy_cache_path.as_deref());
     let cleanup = if let Some(path) = request.roots_path.as_deref() {
         let snapshot = LibraryArtistSnapshot::load(path)?;
         let report = store.cleanup_artist_records(&snapshot)?;
@@ -370,7 +377,7 @@ fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String
             "schema_version":1,
             "state":"compacted",
             "database_bytes":database_bytes(&request.store_path),
-            "retained_lastfm_bytes":retained_storage_bytes(&store, request)?,
+            "retained_lastfm_bytes":retained_storage_bytes(&store, &mut cache_usage)?,
             "artist_edges":statistics.artist_edges,
             "repaired_names":cleanup.as_ref().map_or(0, |result| result.repaired_names),
             "removed_orphans":cleanup.as_ref().map_or(0, |result| result.removed_orphans),
@@ -422,18 +429,13 @@ fn database_bytes(store_path: &str) -> u64 {
         .sum()
 }
 
-fn retained_storage_bytes(store: &GraphStore, request: &GraphRequest) -> Result<u64, String> {
+fn retained_storage_bytes(
+    store: &GraphStore,
+    cache_usage: &mut crate::legacy_cache::CacheUsage,
+) -> Result<u64, String> {
     store
         .retained_lastfm_bytes()
-        .map(|bytes| bytes.saturating_add(legacy_cache_bytes(request)))
-}
-
-fn legacy_cache_bytes(request: &GraphRequest) -> u64 {
-    request
-        .legacy_cache_path
-        .as_deref()
-        .and_then(|path| std::fs::metadata(path).ok().map(|value| value.len()))
-        .unwrap_or(0)
+        .and_then(|bytes| Ok(bytes.saturating_add(cache_usage.bytes(unix_seconds())?)))
 }
 
 fn unix_seconds() -> i64 {

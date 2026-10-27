@@ -206,7 +206,7 @@ fn compact_uses_current_library_snapshot_and_reports_targeted_cleanup() {
 fn status_is_read_only_and_reports_a_missing_or_available_graph() {
     let store = temp_path("status", "sqlite");
     let legacy_cache = temp_path("legacy-status", "json");
-    fs::write(&legacy_cache, b"legacy-lastfm-data").unwrap();
+    fs::write(&legacy_cache, br#"{"schema_version":1,"entries":{"artist:test":{"fetched_at_unix_seconds":1,"value":[{"name":"AB"}]}}}"#).unwrap();
     let request_path = request(
         &store,
         serde_json::json!({"legacy_cache_path":legacy_cache}),
@@ -216,7 +216,7 @@ fn status_is_read_only_and_reports_a_missing_or_available_graph() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["state"], "missing");
     assert_eq!(value["database_bytes"], 0);
-    assert_eq!(value["retained_lastfm_bytes"], 18);
+    assert_eq!(value["retained_lastfm_bytes"], 2);
 
     bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
     let output = run("status", &request_path);
@@ -224,10 +224,69 @@ fn status_is_read_only_and_reports_a_missing_or_available_graph() {
     let value: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["state"], "available");
     assert!(value["database_bytes"].as_u64().unwrap() > 0);
-    assert_eq!(value["retained_lastfm_bytes"], 18);
+    assert_eq!(value["retained_lastfm_bytes"], 2);
     let _ = fs::remove_file(request_path);
     let _ = fs::remove_file(store);
     let _ = fs::remove_file(legacy_cache);
+}
+
+#[test]
+fn unreadable_cache_is_preserved_and_accounting_reports_an_error() {
+    let store = temp_path("invalid-status", "sqlite");
+    let cache = temp_path("invalid-cache", "json");
+    fs::write(&cache, b"invalid cache content").unwrap();
+    let request_path = request(&store, serde_json::json!({"legacy_cache_path":cache}));
+    let output = run("status", &request_path);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout)
+        .contains("cannot account unrecognized Last.fm cache"));
+    assert_eq!(fs::read(&cache).unwrap(), b"invalid cache content");
+    let _ = fs::remove_file(request_path);
+    let _ = fs::remove_file(&cache);
+    let _ = fs::remove_file(cache.with_extension("lock"));
+}
+
+#[test]
+fn graph_status_prunes_expired_track_cache_before_reporting_retained_payload() {
+    use bliss_guidance_lastfm::lastfm_api::SimilarTrack;
+    let store = temp_path("status-track-data", "sqlite");
+    let cache = temp_path("status-track-cache", "json");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let track = SimilarTrack {
+        artist: "Artist".into(),
+        title: "Title".into(),
+        artist_mbid: None,
+        recording_mbid: None,
+        score: Some(0.5),
+    };
+    fs::write(
+        &cache,
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version":1, "entries":{
+                "track:expired":{"fetched_at_unix_seconds":now-90000,"value":[track]},
+                "track:current":{"fetched_at_unix_seconds":now,"value":[track]}
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let request_path = request(&store, serde_json::json!({"legacy_cache_path":cache}));
+    let output = run("status", &request_path);
+    assert!(output.status.success());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        value["retained_lastfm_bytes"],
+        (track.artist.len() + track.title.len() + "0.5".len()) as u64
+    );
+    let persisted: Value = serde_json::from_slice(&fs::read(&cache).unwrap()).unwrap();
+    assert!(persisted["entries"].get("track:expired").is_none());
+    assert!(persisted["entries"].get("track:current").is_some());
+    let _ = fs::remove_file(request_path);
+    let _ = fs::remove_file(&cache);
+    let _ = fs::remove_file(cache.with_extension("lock"));
 }
 
 #[test]

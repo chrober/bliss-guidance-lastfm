@@ -12,6 +12,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::path::Path;
+use std::path::PathBuf;
+use std::time::SystemTime;
 
 const CACHE_SCHEMA_VERSION: u8 = 1;
 const ARTIST_POSITIVE_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -42,6 +44,148 @@ struct CacheEntry {
 struct CacheFile {
     schema_version: u8,
     entries: BTreeMap<String, CacheEntry>,
+}
+
+// Count retained value bytes, not JSON keys, punctuation, cache keys, timestamps,
+// or pretty-printing. Numbers use their canonical decimal representation.
+fn data_value_bytes(value: &Value) -> u64 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Number(value) => value.to_string().len() as u64,
+        Value::String(value) => value.len() as u64,
+        Value::Array(values) => values
+            .iter()
+            .map(data_value_bytes)
+            .fold(0, u64::saturating_add),
+        Value::Object(values) => values
+            .values()
+            .map(data_value_bytes)
+            .fold(0, u64::saturating_add),
+    }
+}
+
+fn retained_payload_size(cache: &CacheFile) -> u64 {
+    let mut total = 0_u64;
+    for entry in cache.entries.values() {
+        total = total.saturating_add(data_value_bytes(&entry.value));
+    }
+    total
+}
+
+fn remove_expired_tracks(cache: &mut CacheFile, now: i64) -> bool {
+    let before = cache.entries.len();
+    cache.entries.retain(|key, entry| {
+        !key.starts_with("track:")
+            || entry
+                .fetched_at_unix_seconds
+                .saturating_add(TRACK_TTL_SECONDS)
+                > now
+    });
+    cache.entries.len() != before
+}
+
+fn write_cache(path: &Path, cache: &CacheFile) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(cache)
+        .map_err(|error| format!("cannot encode retained Last.fm cache: {error}"))?;
+    let temporary = path.with_extension("track-cache.tmp");
+    fs::write(&temporary, bytes)
+        .map_err(|error| format!("cannot write Last.fm track cache: {error}"))?;
+    fs::rename(&temporary, path)
+        .map_err(|error| format!("cannot replace Last.fm track cache: {error}"))
+}
+
+fn retained_cache_summary(path: &Path, now: i64) -> Result<(u64, Option<i64>), String> {
+    if !path.exists() {
+        return Ok((0, None));
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path.with_extension("lock"))
+        .map_err(|e| format!("cannot open Last.fm cache lock: {e}"))?;
+    lock.lock_exclusive()
+        .map_err(|e| format!("cannot lock Last.fm cache: {e}"))?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, None)),
+        Err(error) => return Err(format!("cannot read Last.fm cache: {error}")),
+    };
+    let mut cache = match serde_json::from_slice::<CacheFile>(&bytes) {
+        Ok(value) if value.schema_version == CACHE_SCHEMA_VERSION => value,
+        // Do not silently guess a size or overwrite an unreadable cache.
+        _ => return Err("cannot account unrecognized Last.fm cache; file preserved".to_owned()),
+    };
+    if remove_expired_tracks(&mut cache, now) {
+        write_cache(path, &cache)?;
+    }
+    let next_expiry = cache
+        .entries
+        .iter()
+        .filter(|(key, _)| key.starts_with("track:"))
+        .map(|(_, value)| {
+            value
+                .fetched_at_unix_seconds
+                .saturating_add(TRACK_TTL_SECONDS)
+        })
+        .min();
+    let size = retained_payload_size(&cache);
+    FileExt::unlock(&lock).map_err(|e| format!("cannot unlock Last.fm cache: {e}"))?;
+    Ok((size, next_expiry))
+}
+
+pub fn retained_cache_bytes(path: impl AsRef<Path>, now: i64) -> Result<u64, String> {
+    retained_cache_summary(path.as_ref(), now).map(|value| value.0)
+}
+
+#[derive(Default)]
+pub struct CacheUsage {
+    path: Option<PathBuf>,
+    last: Option<(u64, SystemTime, Option<i64>, u64)>,
+}
+
+impl CacheUsage {
+    pub fn new(path: Option<&str>) -> Self {
+        Self {
+            path: path.map(PathBuf::from),
+            last: None,
+        }
+    }
+    pub fn bytes(&mut self, now: i64) -> Result<u64, String> {
+        let Some(path) = self.path.as_deref() else {
+            return Ok(0);
+        };
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.last = None;
+                return Ok(0);
+            }
+            Err(error) => return Err(format!("cannot inspect Last.fm cache: {error}")),
+        };
+        if let (Some((length, modified, expiry, bytes)), Ok(current)) =
+            (&self.last, metadata.modified())
+        {
+            if *length == metadata.len()
+                && *modified == current
+                && expiry.is_none_or(|value| now < value)
+            {
+                return Ok(*bytes);
+            }
+        }
+        let (bytes, expiry) = retained_cache_summary(path, now)?;
+        self.last = match (metadata.modified(), fs::metadata(path)) {
+            (Ok(before), Ok(after))
+                if metadata.len() == after.len() && after.modified().ok() == Some(before) =>
+            {
+                Some((after.len(), before, expiry, bytes))
+            }
+            _ => None,
+        };
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -199,20 +343,24 @@ pub fn cache_tracks_with_budget(
     lock.lock_exclusive()
         .map_err(|error| format!("cannot lock Last.fm track cache: {error}"))?;
     let mut cache = if path.exists() {
-        fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<CacheFile>(&bytes).ok())
-            .filter(|cache| cache.schema_version == CACHE_SCHEMA_VERSION)
-            .unwrap_or(CacheFile {
-                schema_version: CACHE_SCHEMA_VERSION,
-                entries: BTreeMap::new(),
-            })
+        let bytes =
+            fs::read(path).map_err(|error| format!("cannot read Last.fm track cache: {error}"))?;
+        let cache = serde_json::from_slice::<CacheFile>(&bytes)
+            .map_err(|error| format!("invalid Last.fm track cache; preserving file: {error}"))?;
+        if cache.schema_version != CACHE_SCHEMA_VERSION {
+            return Err("unsupported Last.fm track cache; preserving file".to_owned());
+        }
+        cache
     } else {
         CacheFile {
             schema_version: CACHE_SCHEMA_VERSION,
             entries: BTreeMap::new(),
         }
     };
+    let expired_removed = remove_expired_tracks(&mut cache, fetched_at);
+    if expired_removed {
+        write_cache(path, &cache)?;
+    }
     cache.entries.insert(
         format!("track:{key}"),
         CacheEntry {
@@ -221,18 +369,12 @@ pub fn cache_tracks_with_budget(
                 .map_err(|error| format!("cannot encode Last.fm track cache: {error}"))?,
         },
     );
-    let bytes = serde_json::to_vec_pretty(&cache)
-        .map_err(|error| format!("cannot encode Last.fm track cache: {error}"))?;
-    if bytes.len() as u64 > budget_bytes {
+    if retained_payload_size(&cache) > budget_bytes {
         FileExt::unlock(&lock)
             .map_err(|error| format!("cannot unlock Last.fm track cache: {error}"))?;
         return Ok(false);
     }
-    let temporary_path = path.with_extension("track-cache.tmp");
-    fs::write(&temporary_path, bytes)
-        .map_err(|error| format!("cannot write Last.fm track cache: {error}"))?;
-    fs::rename(&temporary_path, path)
-        .map_err(|error| format!("cannot replace Last.fm track cache: {error}"))?;
+    write_cache(path, &cache)?;
     FileExt::unlock(&lock)
         .map_err(|error| format!("cannot unlock Last.fm track cache: {error}"))?;
     Ok(true)

@@ -53,15 +53,88 @@ fn failures_expose_safe_http_and_parse_context_without_credentials() {
 
 #[test]
 fn track_cache_does_not_grow_past_its_remaining_budget() {
+    use bliss_guidance_lastfm::lastfm_api::SimilarTrack;
     use bliss_guidance_lastfm::legacy_cache::{cache_tracks_with_budget, cached_tracks};
     let path = database_path("track-budget").with_extension("json");
-    assert!(!cache_tracks_with_budget(&path, "test", 100, &[], 1).unwrap());
+    let track = SimilarTrack {
+        artist: "Artist".into(),
+        title: "Title".into(),
+        artist_mbid: None,
+        recording_mbid: None,
+        score: Some(0.5),
+    };
+    let payload_bytes = (track.artist.len() + track.title.len() + "0.5".len()) as u64;
+    assert!(
+        !cache_tracks_with_budget(&path, "test", 100, std::slice::from_ref(&track), 1).unwrap()
+    );
     assert!(!path.exists());
-    assert!(cache_tracks_with_budget(&path, "test", 100, &[], 1000).unwrap());
+    assert!(cache_tracks_with_budget(
+        &path,
+        "test",
+        100,
+        std::slice::from_ref(&track),
+        payload_bytes
+    )
+    .unwrap());
     let before = std::fs::read(&path).unwrap();
-    assert!(!cache_tracks_with_budget(&path, "another", 100, &[], before.len() as u64).unwrap());
+    assert!(!cache_tracks_with_budget(&path, "another", 100, &[track], payload_bytes).unwrap());
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert!(cached_tracks(&path, "test", 101).unwrap().is_some());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+}
+
+#[test]
+fn track_cache_accounting_excludes_metadata_and_prunes_expired_entries() {
+    use bliss_guidance_lastfm::lastfm_api::SimilarTrack;
+    use bliss_guidance_lastfm::legacy_cache::{cache_tracks_with_budget, retained_cache_bytes};
+    let path = database_path("track-accounting").with_extension("json");
+    let track = SimilarTrack {
+        artist: "Björk".into(),
+        title: "Jóga".into(),
+        artist_mbid: None,
+        recording_mbid: None,
+        score: Some(0.75),
+    };
+    assert!(
+        cache_tracks_with_budget(&path, "old", 100, std::slice::from_ref(&track), 10000).unwrap()
+    );
+    assert!(
+        cache_tracks_with_budget(&path, "live", 200, std::slice::from_ref(&track), 10000).unwrap()
+    );
+    let now = 100 + 86400;
+    let expected = (track.artist.len() + track.title.len() + "0.75".len()) as u64;
+    assert_eq!(retained_cache_bytes(&path, now).unwrap(), expected);
+    let file = std::fs::read_to_string(&path).unwrap();
+    assert!(!file.contains("track:old"));
+    assert!(file.contains("track:live"));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+}
+
+#[test]
+fn cached_usage_rechecks_when_an_entry_expires_without_a_file_change() {
+    use bliss_guidance_lastfm::lastfm_api::SimilarTrack;
+    use bliss_guidance_lastfm::legacy_cache::{cache_tracks_with_budget, CacheUsage};
+    let path = database_path("expiry-accounting").with_extension("json");
+    let track = SimilarTrack {
+        artist: "Artist".into(),
+        title: "Track".into(),
+        artist_mbid: None,
+        recording_mbid: None,
+        score: None,
+    };
+    assert!(
+        cache_tracks_with_budget(&path, "one", 100, std::slice::from_ref(&track), 10000).unwrap()
+    );
+    let mut usage = CacheUsage::new(path.to_str());
+    let expected = (track.artist.len() + track.title.len()) as u64;
+    assert_eq!(usage.bytes(101).unwrap(), expected);
+    assert_eq!(usage.bytes(102).unwrap(), expected);
+    assert_eq!(usage.bytes(100 + 86400).unwrap(), 0);
+    assert!(!std::fs::read_to_string(&path)
+        .unwrap()
+        .contains("track:one"));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(path.with_extension("lock"));
 }

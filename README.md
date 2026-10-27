@@ -140,8 +140,11 @@ snapshot to repair unambiguous encoding errors and remove unreferenced artists,
 then trims artist edges to the current result limit and optional local-library
 scope before checkpointing SQLite. Repaired observations are revalidated on a
 later request; ambiguous matches remain untouched. `delete` requires explicit
-confirmation. The retained-data budget includes the full JSON track-cache file;
-separate concurrent writers can race between the SQLite and JSON checks.
+confirmation. The retained-data budget includes track-result value bytes, not
+JSON field names, punctuation, cache keys or timestamps. Expired track entries
+are removed under lock on cache access and when graph status checks usage. An
+unreadable or unrecognized cache is preserved and reported as an accounting error.
+Separate concurrent writers can race between the SQLite and JSON checks.
 
 The maintenance and graph paths are unreachable in artifact/LastMix mode.
 That mode neither opens nor reports the SQLite graph.

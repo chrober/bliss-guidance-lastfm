@@ -353,6 +353,9 @@ impl DirectPrepared {
         if let Some(path) = options.legacy_cache_path.as_deref() {
             let _ = crate::legacy_cache::migrate_legacy_cache(path, &mut store, now)?;
         }
+        let mut cache_usage =
+            crate::legacy_cache::CacheUsage::new(options.legacy_cache_path.as_deref());
+        let _ = cache_usage.bytes(now)?;
         let mut track_queries = BTreeMap::<String, (String, String, Option<String>)>::new();
         let mut artist_queries = BTreeMap::<String, (String, Option<String>)>::new();
         for anchor in anchors {
@@ -620,15 +623,9 @@ impl DirectPrepared {
                     now,
                     options.storage_scope,
                     Some(
-                        options.budget_bytes.saturating_sub(
-                            options
-                                .legacy_cache_path
-                                .as_deref()
-                                .and_then(|path| {
-                                    std::fs::metadata(path).ok().map(|value| value.len())
-                                })
-                                .unwrap_or(0),
-                        ),
+                        options
+                            .budget_bytes
+                            .saturating_sub(cache_usage.bytes(unix_seconds() as i64)?),
                     ),
                 ) {
                     Err(_) => persistence_failed += 1,
