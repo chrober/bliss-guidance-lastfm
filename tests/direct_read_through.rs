@@ -102,7 +102,6 @@ fn local_only_refreshes_library_before_persisting_artist_results() {
         })
         .unwrap()
         .unwrap();
-    assert_eq!(store.statistics().unwrap().library_artists, 2);
     assert_eq!(
         store.artist_observation(id).unwrap().unwrap().edges.len(),
         1

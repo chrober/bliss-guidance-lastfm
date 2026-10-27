@@ -569,6 +569,11 @@ fn main() {
             return;
         }
         [command, library, graph] if command == "refresh-library-membership" => {
+            #[cfg(unix)]
+            // This is a standalone background worker; never lower the host's priority.
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
             if let Err(error) = bliss_guidance_lastfm::library_membership::refresh_coalesced(
                 std::path::Path::new(library),
                 std::path::Path::new(graph),

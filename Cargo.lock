@@ -27,6 +27,7 @@ dependencies = [
  "bliss-playlist-guidance-spi",
  "fs2",
  "httpdate",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

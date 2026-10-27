@@ -587,7 +587,8 @@ impl DirectPrepared {
             failures,
         } = fetch_concurrently(options, &api_key, deadline, misses);
         request_count += batch_request_count;
-        let mut membership_ready: Option<bool> = None;
+        let mut local_library: Option<Result<crate::library_membership::LocalLibrary, String>> =
+            None;
         for (task, response) in values {
             let key = task.key().to_owned();
             let result_count = match &response {
@@ -623,19 +624,23 @@ impl DirectPrepared {
                 );
             }
             if matches!(response, FetchResponse::Artist(_)) {
-                let may_persist = if options.storage_scope == StorageScope::LocalArtistsOnly {
-                    *membership_ready.get_or_insert_with(|| {
-                        options.library_db_path.as_deref().is_some_and(|path| {
-                            crate::library_membership::refresh(
-                                std::path::Path::new(path),
-                                std::path::Path::new(&options.store_path),
-                            )
-                            .is_ok()
-                        })
-                    })
-                } else {
-                    true
-                };
+                if options.storage_scope == StorageScope::LocalArtistsOnly
+                    && local_library.is_none()
+                {
+                    local_library = Some(
+                        options
+                            .library_db_path
+                            .as_deref()
+                            .ok_or_else(|| "Lyrion library database is unavailable".to_owned())
+                            .and_then(|path| {
+                                crate::library_membership::LocalLibrary::load(std::path::Path::new(
+                                    path,
+                                ))
+                            }),
+                    );
+                }
+                let may_persist = options.storage_scope != StorageScope::LocalArtistsOnly
+                    || local_library.as_ref().is_some_and(Result::is_ok);
                 if !may_persist {
                     persistence_failed += 1;
                 } else {
@@ -645,6 +650,9 @@ impl DirectPrepared {
                         &response,
                         now,
                         options.storage_scope,
+                        local_library
+                            .as_ref()
+                            .and_then(|result| result.as_ref().ok()),
                         Some(
                             options
                                 .budget_bytes
@@ -720,7 +728,7 @@ impl DirectPrepared {
                 Some(serde_json::json!({"error": error})),
             );
         }
-        if !artist_queries.is_empty() && options.storage_scope != StorageScope::LocalArtistsOnly {
+        if !artist_queries.is_empty() {
             if let Some(library) = options.library_db_path.as_deref() {
                 if let Ok(exe) = std::env::current_exe() {
                     let _ = std::process::Command::new(exe)
@@ -912,6 +920,7 @@ fn persist_response(
     response: &FetchResponse,
     now: i64,
     storage_scope: StorageScope,
+    local_library: Option<&crate::library_membership::LocalLibrary>,
     budget_bytes: Option<u64>,
 ) -> Result<bool, String> {
     match (task, response) {
@@ -963,9 +972,10 @@ fn persist_response(
                 })
                 .collect::<Vec<_>>();
             let hash = canonical_artist_payload_hash("artist.getSimilar", key, &hash_rows);
-            if existing
-                .as_ref()
-                .is_some_and(|value| value.payload_hash == hash)
+            if storage_scope != StorageScope::LocalArtistsOnly
+                && existing
+                    .as_ref()
+                    .is_some_and(|value| value.payload_hash == hash)
             {
                 store.revalidate_artist_observation(
                     *source_id,
@@ -984,13 +994,20 @@ fn persist_response(
                         store.resolve_or_create_artist(&identity, now)?
                     }
                     StorageScope::LocalArtistsOnly => {
-                        let Some(target_id) = store.find_artist(&identity)? else {
-                            continue;
-                        };
-                        if !store.is_library_artist(target_id)? {
-                            continue;
+                        if let Some(library) = local_library {
+                            let Some(local_identity) = library.matching(&identity) else {
+                                continue;
+                            };
+                            store.resolve_or_create_artist(local_identity, now)?
+                        } else {
+                            let Some(target_id) = store.find_artist(&identity)? else {
+                                continue;
+                            };
+                            if !store.is_library_artist(target_id)? {
+                                continue;
+                            }
+                            target_id
                         }
-                        target_id
                     }
                 };
                 edges.push(ArtistEdgeWrite {
@@ -1044,6 +1061,7 @@ pub(crate) fn persist_artist_response(
         &FetchResponse::Artist(response.clone()),
         now,
         storage_scope,
+        None,
         Some(budget_bytes),
     )?;
     if !stored {

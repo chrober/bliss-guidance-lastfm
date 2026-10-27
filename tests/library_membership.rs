@@ -17,6 +17,24 @@ fn library_membership_refresh_tracks_additions_removals_and_distinct_mbids() {
     let graph = dir.join("graph.db");
     let db = Connection::open(&library).unwrap();
     db.execute_batch("CREATE TABLE contributors(id INTEGER PRIMARY KEY,name TEXT,musicbrainz_id TEXT); CREATE TABLE tracks(id INTEGER PRIMARY KEY,remote INTEGER); CREATE TABLE contributor_track(contributor INTEGER,track INTEGER); INSERT INTO tracks VALUES(1,0),(2,1); INSERT INTO contributors VALUES(1,'First','mbid-1'),(2,'Shared','mbid-2'),(3,'Shared','mbid-3'),(4,'Remote',NULL); INSERT INTO contributor_track VALUES(1,1),(2,1),(3,1),(4,2);").unwrap();
+    let local = bliss_guidance_lastfm::library_membership::LocalLibrary::load(&library).unwrap();
+    assert!(local
+        .matching(&bliss_guidance_lastfm::store::ArtistIdentity {
+            name: "Shared".into(),
+            mbid: None
+        })
+        .is_none());
+    assert_eq!(
+        local
+            .matching(&bliss_guidance_lastfm::store::ArtistIdentity {
+                name: "Shared".into(),
+                mbid: Some("mbid-3".into())
+            })
+            .unwrap()
+            .mbid
+            .as_deref(),
+        Some("mbid-3")
+    );
     let status = std::process::Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
         .arg("refresh-library-membership")
         .arg(&library)
