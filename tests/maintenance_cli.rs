@@ -37,6 +37,86 @@ fn run(command: &str, request: &std::path::Path) -> std::process::Output {
 }
 
 #[test]
+fn sync_counts_unique_resolved_library_artists_without_merging_distinct_mbids() {
+    use bliss_guidance_lastfm::store::{ArtistObservationWrite, GraphStore, ObservationStatus};
+    let store_path = temp_path("unique-roots", "sqlite");
+    let roots_path = temp_path("unique-roots", "json");
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let mut store = GraphStore::open(&store_path).unwrap();
+    for (mbid, name) in [
+        (None, "Example Artist"),
+        (Some("artist-one"), "Shared Name"),
+        (Some("artist-two"), "Shared Name"),
+    ] {
+        let id = store.upsert_artist(mbid, name, now).unwrap();
+        store
+            .replace_artist_observation(
+                id,
+                &ArtistObservationWrite {
+                    fetched_at: now,
+                    validated_at: now,
+                    changed_at: now,
+                    expires_at: now + 3600,
+                    etag: None,
+                    last_modified: None,
+                    payload_hash: "fixture".to_owned(),
+                    acquisition_source: "api_key".to_owned(),
+                    requested_limit: 25,
+                    actual_result_count: 0,
+                    result_status: ObservationStatus::Empty,
+                },
+                &[],
+            )
+            .unwrap();
+    }
+    drop(store);
+    fs::write(&roots_path, serde_json::to_vec(&serde_json::json!({
+        "kind":"lastfm-library-artist-roots-v1", "snapshot_id":"unique", "library_identity":"test", "generated_at":now,
+        "artists":[
+            {"lms_contributor_id":1,"name":"Example Artist","artist_mbids":[]},
+            {"lms_contributor_id":2,"name":"EXAMPLE ARTIST","artist_mbids":[]},
+            {"lms_contributor_id":3,"name":"Shared Name","artist_mbids":["artist-one"]},
+            {"lms_contributor_id":4,"name":"Shared Name","artist_mbids":["artist-two"]}
+        ]
+    })).unwrap()).unwrap();
+    let request_path = request(
+        &store_path,
+        serde_json::json!({"acquisition_mode":"direct", "roots_path":roots_path}),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .args(["graph", "sync", "--request"])
+        .arg(&request_path)
+        .env("BLISS_GUIDANCE_LASTFM_API_KEY", "fixture")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let events: Vec<Value> = stdout
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let last = events.last().unwrap();
+    assert_eq!(last["total"], 3);
+    assert_eq!(last["current"], 3);
+    assert_eq!(last["cached"], 3);
+    let store = GraphStore::open(&store_path).unwrap();
+    let stats = store.statistics().unwrap();
+    assert_eq!(stats.library_artists, 3);
+    assert_eq!(stats.covered_library_artists, 3);
+    drop(store);
+    let _ = fs::remove_file(request_path);
+    let _ = fs::remove_file(roots_path);
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
 fn sync_failure_identifies_artist_and_safe_parse_context() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -366,15 +446,16 @@ fn sync_emits_versioned_progress_and_strictly_respects_the_budget() {
     assert!(events.contains("\"budget_exhausted\":true"));
     let first_event: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
     assert_eq!(first_event["current"], 0);
-    assert_eq!(first_event["total"], 1);
+    assert_eq!(first_event["total"], 0);
     assert!(first_event["message"]
         .as_str()
         .unwrap()
-        .starts_with("Preparing 1 library artists"));
+        .starts_with("Preparing library artists"));
     let parsed_events: Vec<Value> = events
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
+    assert!(parsed_events.iter().any(|event| event["total"] == 1));
     let fetching_event = parsed_events
         .iter()
         .find(|event| {

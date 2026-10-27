@@ -136,23 +136,29 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     let mut store = GraphStore::open_at(&request.store_path, now)?;
     let mut cache_usage =
         crate::legacy_cache::CacheUsage::new(request.legacy_cache_path.as_deref());
-    let total = snapshot.artists.len() as u64;
     let mut progress = GraphProgress::new("sync", "Preparing offline Last.fm update");
-    progress.message = format!("Preparing {total} library artists for offline Last.fm update");
-    progress.total = total;
+    progress.message = "Preparing library artists for offline Last.fm update".to_owned();
     progress.database_bytes = database_bytes(&request.store_path);
     progress.retained_lastfm_bytes = retained_storage_bytes(&store, &mut cache_usage)?;
     emit_json(output, &progress)?;
     let mut artist_ids = Vec::with_capacity(snapshot.artists.len());
+    let mut roots = Vec::with_capacity(snapshot.artists.len());
+    let mut seen = std::collections::HashSet::with_capacity(snapshot.artists.len());
     for root in &snapshot.artists {
-        artist_ids.push(store.resolve_or_create_artist(
+        let artist_id = store.resolve_or_create_artist(
             &ArtistIdentity {
                 mbid: root.artist_mbids.first().cloned(),
                 name: root.name.clone(),
             },
             now,
-        )?);
+        )?;
+        if seen.insert(artist_id) {
+            artist_ids.push(artist_id);
+            roots.push((root, artist_id));
+        }
     }
+    let total = roots.len() as u64;
+    progress.total = total;
     store.replace_library_membership(
         &snapshot.snapshot_id,
         &snapshot.library_identity,
@@ -165,7 +171,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     progress.retained_lastfm_bytes = retained_storage_bytes(&store, &mut cache_usage)?;
     emit_json(output, &progress)?;
     let client = LastFmClient::new(endpoint, &api_key, Duration::from_secs(30))?;
-    for (index, root) in snapshot.artists.iter().enumerate() {
+    for (index, (root, source_id)) in roots.iter().enumerate() {
         if request
             .cancel_path
             .as_deref()
@@ -180,7 +186,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
             mbid: root.artist_mbids.first().cloned(),
             name: root.name.clone(),
         };
-        let source_id = store.resolve_or_create_artist(&identity, now)?;
+        let source_id = *source_id;
         let stored = store.artist_observation(source_id)?;
         let sufficient = stored.as_ref().is_some_and(|value| {
             artist_observation_is_fresh(
@@ -323,7 +329,7 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                 emit_json(output, &progress)?;
                 return Ok(());
             }
-            if index + 1 < snapshot.artists.len() {
+            if index + 1 < roots.len() {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
