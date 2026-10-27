@@ -135,9 +135,13 @@ The current implementation does not interpret every HTTP caching directive.
 The budget counts a deterministic canonical representation of stored Last.fm
 result identities, ranks, scores, and HTTP validators; it does not count
 SQLite pages, indexes, WAL, SHM, or Lyrion-owned identities. Physical SQLite
-storage is reported separately. `compact` trims
-stored artist edges to the current result limit and optional local-library
-scope before checkpointing SQLite. `delete` requires explicit confirmation.
+storage is reported separately. `compact` uses an optional current library
+snapshot to repair unambiguous encoding errors and remove unreferenced artists,
+then trims artist edges to the current result limit and optional local-library
+scope before checkpointing SQLite. Repaired observations are revalidated on a
+later request; ambiguous matches remain untouched. `delete` requires explicit
+confirmation. The retained-data budget includes the full JSON track-cache file;
+separate concurrent writers can race between the SQLite and JSON checks.
 
 The maintenance and graph paths are unreachable in artifact/LastMix mode.
 That mode neither opens nor reports the SQLite graph.

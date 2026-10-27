@@ -619,7 +619,17 @@ impl DirectPrepared {
                     &response,
                     now,
                     options.storage_scope,
-                    Some(options.budget_bytes),
+                    Some(
+                        options.budget_bytes.saturating_sub(
+                            options
+                                .legacy_cache_path
+                                .as_deref()
+                                .and_then(|path| {
+                                    std::fs::metadata(path).ok().map(|value| value.len())
+                                })
+                                .unwrap_or(0),
+                        ),
+                    ),
                 ) {
                     Err(_) => persistence_failed += 1,
                     Ok(true) => {}
@@ -641,10 +651,26 @@ impl DirectPrepared {
             match response {
                 FetchResponse::Track(value) => {
                     if let Some(path) = options.legacy_cache_path.as_deref() {
-                        if crate::legacy_cache::cache_tracks(path, &key, now, &value.results)
-                            .is_err()
-                        {
-                            persistence_failed += 1;
+                        let graph_bytes = store.retained_lastfm_bytes()?;
+                        match crate::legacy_cache::cache_tracks_with_budget(
+                            path,
+                            &key,
+                            now,
+                            &value.results,
+                            options.budget_bytes.saturating_sub(graph_bytes),
+                        ) {
+                            Err(_) => persistence_failed += 1,
+                            Ok(false) if wants_info(&options.diagnostic_level) => push_log_event(
+                                &mut log_events,
+                                "info",
+                                "lastfm_persistence_skipped",
+                                Some(task.operation()),
+                                Some(task.source()),
+                                Some("budget_exhausted"),
+                                Some(result_count),
+                                Some(serde_json::json!({"budget_bytes": options.budget_bytes})),
+                            ),
+                            _ => {}
                         }
                     }
                     tracks.insert(key, value.results);

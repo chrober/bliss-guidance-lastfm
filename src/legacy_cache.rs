@@ -177,6 +177,16 @@ pub fn cache_tracks(
     fetched_at: i64,
     tracks: &[SimilarTrack],
 ) -> Result<(), String> {
+    cache_tracks_with_budget(path, key, fetched_at, tracks, u64::MAX).map(|_| ())
+}
+
+pub fn cache_tracks_with_budget(
+    path: impl AsRef<Path>,
+    key: &str,
+    fetched_at: i64,
+    tracks: &[SimilarTrack],
+    budget_bytes: u64,
+) -> Result<bool, String> {
     let path = path.as_ref();
     let lock_path = path.with_extension("lock");
     let lock = OpenOptions::new()
@@ -213,12 +223,19 @@ pub fn cache_tracks(
     );
     let bytes = serde_json::to_vec_pretty(&cache)
         .map_err(|error| format!("cannot encode Last.fm track cache: {error}"))?;
+    if bytes.len() as u64 > budget_bytes {
+        FileExt::unlock(&lock)
+            .map_err(|error| format!("cannot unlock Last.fm track cache: {error}"))?;
+        return Ok(false);
+    }
     let temporary_path = path.with_extension("track-cache.tmp");
     fs::write(&temporary_path, bytes)
         .map_err(|error| format!("cannot write Last.fm track cache: {error}"))?;
     fs::rename(&temporary_path, path)
         .map_err(|error| format!("cannot replace Last.fm track cache: {error}"))?;
-    FileExt::unlock(&lock).map_err(|error| format!("cannot unlock Last.fm track cache: {error}"))
+    FileExt::unlock(&lock)
+        .map_err(|error| format!("cannot unlock Last.fm track cache: {error}"))?;
+    Ok(true)
 }
 
 fn decode_import(cache: CacheFile) -> Result<LegacyGraphImport, String> {

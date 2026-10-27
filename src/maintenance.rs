@@ -285,7 +285,10 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                 &response,
                 unix_seconds(),
                 storage_scope,
-                request.budget_bytes.unwrap_or(DEFAULT_BUDGET_BYTES),
+                request
+                    .budget_bytes
+                    .unwrap_or(DEFAULT_BUDGET_BYTES)
+                    .saturating_sub(legacy_cache_bytes(request)),
             )?;
             match persisted {
                 Some(true) => progress.changed += 1,
@@ -334,6 +337,29 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
 fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     request.require_api_key()?;
     let mut store = GraphStore::open(&request.store_path)?;
+    let cleanup = if let Some(path) = request.roots_path.as_deref() {
+        let snapshot = LibraryArtistSnapshot::load(path)?;
+        let report = store.cleanup_artist_records(&snapshot)?;
+        let mut artist_ids = Vec::with_capacity(snapshot.artists.len());
+        for root in &snapshot.artists {
+            artist_ids.push(store.resolve_or_create_artist(
+                &ArtistIdentity {
+                    mbid: root.artist_mbids.first().cloned(),
+                    name: root.name.clone(),
+                },
+                unix_seconds(),
+            )?);
+        }
+        store.replace_library_membership(
+            &snapshot.snapshot_id,
+            &snapshot.library_identity,
+            snapshot.generated_at,
+            &artist_ids,
+        )?;
+        Some(report)
+    } else {
+        None
+    };
     let limit = request.artist_limit()?.value();
     let local_only = request.storage_scope()? == StorageScope::LocalArtistsOnly;
     store.checkpoint_and_compact(limit, local_only)?;
@@ -346,6 +372,9 @@ fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String
             "database_bytes":database_bytes(&request.store_path),
             "retained_lastfm_bytes":retained_storage_bytes(&store, request)?,
             "artist_edges":statistics.artist_edges,
+            "repaired_names":cleanup.as_ref().map_or(0, |result| result.repaired_names),
+            "removed_orphans":cleanup.as_ref().map_or(0, |result| result.removed_orphans),
+            "ambiguous_names":cleanup.as_ref().map_or(0, |result| result.ambiguous_names),
         }),
     )
 }

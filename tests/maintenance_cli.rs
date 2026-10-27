@@ -155,6 +155,54 @@ fn custom_empty_target_revalidates_a_fresh_cached_observation_conditionally() {
 }
 
 #[test]
+fn compact_uses_current_library_snapshot_and_reports_targeted_cleanup() {
+    use bliss_guidance_lastfm::store::GraphStore;
+    let store_path = temp_path("cleanup", "sqlite");
+    let mut store = GraphStore::open(&store_path).unwrap();
+    let source = store
+        .upsert_artist(Some("seed-artist-mbid"), "BjÃ¶rk", 10)
+        .unwrap();
+    let orphan = store.upsert_artist(None, "Unused", 10).unwrap();
+    store
+        .replace_library_membership("old", "old", 10, &[source, orphan])
+        .unwrap();
+    drop(store);
+    let roots_path = temp_path("roots", "json");
+    fs::write(&roots_path, serde_json::to_vec(&serde_json::json!({
+        "kind":"lastfm-library-artist-roots-v1", "snapshot_id":"fresh", "library_identity":"l", "generated_at":20,
+        "artists":[{"lms_contributor_id":1,"name":"Björk","artist_mbids":["seed-artist-mbid"]}]
+    })).unwrap()).unwrap();
+    let request_path = request(
+        &store_path,
+        serde_json::json!({"acquisition_mode":"direct", "roots_path":roots_path}),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .args(["graph", "compact", "--request"])
+        .arg(&request_path)
+        .env("BLISS_GUIDANCE_LASTFM_API_KEY", "test-key")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["repaired_names"], 1);
+    assert_eq!(result["removed_orphans"], 1);
+    let store = GraphStore::open(&store_path).unwrap();
+    assert_eq!(
+        store.artist(source).unwrap().unwrap().canonical_name,
+        "Björk"
+    );
+    assert!(store.artist(orphan).unwrap().is_none());
+    drop(store);
+    let _ = fs::remove_file(request_path);
+    let _ = fs::remove_file(roots_path);
+    let _ = fs::remove_file(store_path);
+}
+
+#[test]
 fn status_is_read_only_and_reports_a_missing_or_available_graph() {
     let store = temp_path("status", "sqlite");
     let legacy_cache = temp_path("legacy-status", "json");

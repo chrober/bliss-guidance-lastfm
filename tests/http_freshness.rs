@@ -52,6 +52,21 @@ fn failures_expose_safe_http_and_parse_context_without_credentials() {
 }
 
 #[test]
+fn track_cache_does_not_grow_past_its_remaining_budget() {
+    use bliss_guidance_lastfm::legacy_cache::{cache_tracks_with_budget, cached_tracks};
+    let path = database_path("track-budget").with_extension("json");
+    assert!(!cache_tracks_with_budget(&path, "test", 100, &[], 1).unwrap());
+    assert!(!path.exists());
+    assert!(cache_tracks_with_budget(&path, "test", 100, &[], 1000).unwrap());
+    let before = std::fs::read(&path).unwrap();
+    assert!(!cache_tracks_with_budget(&path, "another", 100, &[], before.len() as u64).unwrap());
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(cached_tracks(&path, "test", 101).unwrap().is_some());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(path.with_extension("lock"));
+}
+
+#[test]
 fn artist_response_captures_limit_validators_and_freshness_headers() {
     let body =
         r#"{"similarartists":{"artist":[{"name":"Target","mbid":"target-mbid","match":"0.75"}]}}"#;

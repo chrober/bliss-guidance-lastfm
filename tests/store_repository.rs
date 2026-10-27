@@ -511,3 +511,97 @@ fn compaction_applies_the_current_result_limit_and_local_artist_scope() {
     drop(store);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn cleanup_repairs_unambiguous_library_mojibake_and_preserves_referenced_external_artists() {
+    use bliss_guidance_lastfm::root_snapshot::{LibraryArtistRoot, LibraryArtistSnapshot};
+    let path = database_path("targeted-cleanup");
+    let mut store = GraphStore::open(&path).unwrap();
+    let broken = store
+        .upsert_artist(Some("seed-mbid"), "UkulÃ©lÃ©", 10)
+        .unwrap();
+    let external = store.upsert_artist(None, "External Artist", 10).unwrap();
+    let same_name_other_identity = store.upsert_artist(None, "Ukulélé", 10).unwrap();
+    let unused = store.upsert_artist(None, "Unreferenced", 10).unwrap();
+    store
+        .replace_library_membership("old", "library", 10, &[broken, unused])
+        .unwrap();
+    store
+        .replace_artist_observation(
+            broken,
+            &observation("hash", ObservationStatus::Positive),
+            &[ArtistEdgeWrite {
+                target_artist_id: external,
+                rank: 1,
+                match_score: Some(0.9),
+            }],
+        )
+        .unwrap();
+    let roots = LibraryArtistSnapshot {
+        kind: "lastfm-library-artist-roots-v1".to_owned(),
+        snapshot_id: "fresh".to_owned(),
+        library_identity: "library".to_owned(),
+        generated_at: 20,
+        artists: vec![LibraryArtistRoot {
+            lms_contributor_id: 1,
+            name: "Ukulélé".to_owned(),
+            artist_mbids: vec!["seed-mbid".to_owned()],
+        }],
+    };
+    let result = store.cleanup_artist_records(&roots).unwrap();
+    assert_eq!(result.repaired_names, 1);
+    assert_eq!(result.removed_orphans, 1);
+    assert_eq!(
+        store.artist(broken).unwrap().unwrap().canonical_name,
+        "Ukulélé"
+    );
+    assert!(store.artist(external).unwrap().is_some());
+    assert!(store.artist(same_name_other_identity).unwrap().is_some());
+    assert!(store.artist(unused).unwrap().is_none());
+    assert_eq!(
+        store.artist_observation(broken).unwrap().unwrap().edges[0].target_artist_id,
+        external
+    );
+    assert_eq!(
+        store
+            .artist_observation(broken)
+            .unwrap()
+            .unwrap()
+            .validated_at,
+        0
+    );
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn cleanup_leaves_ambiguous_mojibake_untouched() {
+    use bliss_guidance_lastfm::root_snapshot::{LibraryArtistRoot, LibraryArtistSnapshot};
+    let path = database_path("cleanup-ambiguous");
+    let mut store = GraphStore::open(&path).unwrap();
+    let broken = store.upsert_artist(None, "Björk Ã©", 10).unwrap();
+    let correct = store.upsert_artist(None, "Björk é", 10).unwrap();
+    let snapshot = LibraryArtistSnapshot {
+        kind: "lastfm-library-artist-roots-v1".into(),
+        snapshot_id: "s".into(),
+        library_identity: "l".into(),
+        generated_at: 10,
+        artists: vec![LibraryArtistRoot {
+            lms_contributor_id: 1,
+            name: "Björk é".into(),
+            artist_mbids: vec![],
+        }],
+    };
+    // The actual double-encoding affects the entire original UTF-8 string.
+    let fully_broken = store.upsert_artist(None, "BjÃ¶rk Ã©", 10).unwrap();
+    let report = store.cleanup_artist_records(&snapshot).unwrap();
+    assert_eq!(report.ambiguous_names, 1);
+    assert_eq!(
+        store.artist(fully_broken).unwrap().unwrap().canonical_name,
+        "BjÃ¶rk Ã©"
+    );
+    assert!(store.artist(correct).unwrap().is_some());
+    assert!(store.artist(broken).unwrap().is_none());
+    drop(store);
+    let _ = std::fs::remove_file(path);
+}

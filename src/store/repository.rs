@@ -8,6 +8,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ArtistCleanupReport {
+    pub repaired_names: usize,
+    pub removed_orphans: usize,
+    pub ambiguous_names: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ObservationStatus {
     Positive,
@@ -312,6 +319,118 @@ impl GraphStore {
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
             .map_err(|error| format!("cannot compact Last.fm graph: {error}"))
+    }
+
+    pub fn cleanup_artist_records(
+        &mut self,
+        snapshot: &crate::root_snapshot::LibraryArtistSnapshot,
+    ) -> Result<ArtistCleanupReport, String> {
+        snapshot.validate()?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|e| format!("cannot start artist cleanup: {e}"))?;
+        let mut by_mojibake: HashMap<String, Vec<&crate::root_snapshot::LibraryArtistRoot>> =
+            HashMap::new();
+        let mut protected_names = HashSet::new();
+        let mut protected_mbids = HashSet::new();
+        for root in &snapshot.artists {
+            protected_names.insert(normalize_name(&root.name));
+            for mbid in &root.artist_mbids {
+                protected_mbids.insert(mbid.to_ascii_lowercase());
+            }
+            let wrong: String = root
+                .name
+                .as_bytes()
+                .iter()
+                .map(|byte| char::from(*byte))
+                .collect();
+            if wrong != root.name {
+                by_mojibake.entry(wrong).or_default().push(root);
+            }
+        }
+        let artists = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT artist_id, artist_mbid, canonical_name, normalized_name FROM artists",
+                )
+                .map_err(|e| format!("cannot inspect graph artists: {e}"))?;
+            let rows = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(|e| format!("cannot query graph artists: {e}"))?;
+            rows.collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("cannot read graph artist: {e}"))?
+        };
+        let mut report = ArtistCleanupReport::default();
+        for (id, mbid, name, old_normalized) in &artists {
+            let Some(roots) = by_mojibake.get(name) else {
+                continue;
+            };
+            if protected_names.contains(old_normalized) {
+                report.ambiguous_names += 1;
+                continue;
+            }
+            let matches: Vec<_> = roots
+                .iter()
+                .filter(|root| match mbid.as_deref() {
+                    Some(value) if !value.is_empty() => root
+                        .artist_mbids
+                        .iter()
+                        .any(|id| id.eq_ignore_ascii_case(value)),
+                    _ => true,
+                })
+                .collect();
+            if matches.len() != 1 {
+                report.ambiguous_names += 1;
+                continue;
+            }
+            let corrected = &matches[0].name;
+            let normalized = normalize_name(corrected);
+            let collision: i64 = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM artists WHERE artist_id != ?1 AND normalized_name = ?2)",
+                params![id, normalized], |row| row.get(0)).map_err(|e| format!("cannot check artist cleanup collision: {e}"))?;
+            if collision != 0 && mbid.as_deref().is_none_or(str::is_empty) {
+                report.ambiguous_names += 1;
+                continue;
+            }
+            transaction.execute("UPDATE artists SET canonical_name = ?1, normalized_name = ?2 WHERE artist_id = ?3", params![corrected, normalized, id])
+                .map_err(|e| format!("cannot repair artist name: {e}"))?;
+            transaction.execute("UPDATE artist_queries SET expires_at = 0, validated_at = 0, etag = NULL, last_modified = NULL WHERE source_artist_id = ?1", [id])
+                .map_err(|e| format!("cannot schedule repaired artist for revalidation: {e}"))?;
+            transaction.execute("DELETE FROM artist_aliases WHERE artist_id = ?1 AND alias_kind = 'name' AND normalized_value = ?2", params![id, old_normalized])
+                .map_err(|e| format!("cannot remove malformed artist alias: {e}"))?;
+            transaction.execute("INSERT OR IGNORE INTO artist_aliases(artist_id, alias_kind, display_value, normalized_value) VALUES (?1, 'name', ?2, ?3)", params![id, corrected, normalized])
+                .map_err(|e| format!("cannot add corrected artist alias: {e}"))?;
+            report.repaired_names += 1;
+        }
+        for (id, mbid, name, _) in &artists {
+            if protected_names.contains(&normalize_name(name))
+                || by_mojibake.contains_key(name)
+                || mbid
+                    .as_ref()
+                    .is_some_and(|value| protected_mbids.contains(&value.to_ascii_lowercase()))
+            {
+                continue;
+            }
+            transaction.execute(
+                "DELETE FROM library_artist_membership WHERE artist_id = ?1 AND NOT EXISTS (SELECT 1 FROM artist_queries WHERE source_artist_id = ?1) AND NOT EXISTS (SELECT 1 FROM artist_similarity_edges WHERE target_artist_id = ?1)",
+                [id],
+            ).map_err(|e| format!("cannot remove obsolete library membership: {e}"))?;
+            report.removed_orphans += transaction.execute(
+                "DELETE FROM artists WHERE artist_id = ?1 AND NOT EXISTS (SELECT 1 FROM library_artist_membership WHERE artist_id = ?1) AND NOT EXISTS (SELECT 1 FROM artist_queries WHERE source_artist_id = ?1) AND NOT EXISTS (SELECT 1 FROM artist_similarity_edges WHERE target_artist_id = ?1)",
+                [id]).map_err(|e| format!("cannot remove orphaned artist: {e}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|e| format!("cannot commit artist cleanup: {e}"))?;
+        Ok(report)
     }
 
     pub fn upsert_artist(
