@@ -568,6 +568,16 @@ fn main() {
             println!("{}", version_metadata_json());
             return;
         }
+        [command, library, graph] if command == "refresh-library-membership" => {
+            if let Err(error) = bliss_guidance_lastfm::library_membership::refresh_coalesced(
+                std::path::Path::new(library),
+                std::path::Path::new(graph),
+            ) {
+                eprintln!("Last.fm library membership refresh failed: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
         [graph, command, request_flag, request_path]
             if graph == "graph" && request_flag == "--request" =>
         {

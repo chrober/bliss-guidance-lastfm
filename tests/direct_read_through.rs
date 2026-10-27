@@ -65,6 +65,51 @@ fn candidate() -> Candidate {
 }
 
 #[test]
+fn local_only_refreshes_library_before_persisting_artist_results() {
+    let _guard = API_KEY_LOCK.lock().unwrap();
+    std::env::set_var(API_KEY_ENVIRONMENT, "test-key");
+    let graph = store_path();
+    let library = graph.with_extension("library.sqlite");
+    let db = rusqlite::Connection::open(&library).unwrap();
+    db.execute_batch("CREATE TABLE contributors(id INTEGER PRIMARY KEY,name TEXT,musicbrainz_id TEXT); CREATE TABLE tracks(id INTEGER PRIMARY KEY,remote INTEGER); CREATE TABLE contributor_track(contributor INTEGER,track INTEGER); INSERT INTO tracks VALUES(1,0); INSERT INTO contributors VALUES(1,'Seed Artist','seed-artist'),(2,'Related Artist','related-artist'); INSERT INTO contributor_track VALUES(1,1),(2,1);").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0_u8; 8192];
+            let n = stream.read(&mut buf).unwrap();
+            let request = String::from_utf8_lossy(&buf[..n]);
+            let body = if request.contains("track.getSimilar") {
+                r#"{"similartracks":{"track":[]}}"#
+            } else {
+                r#"{"similarartists":{"artist":[{"name":"Related Artist","mbid":"related-artist","match":"0.8"}]}}"#
+            };
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        }
+    });
+    let mut opts = options(&endpoint, &graph, "online_with_cache");
+    opts.storage_scope = bliss_guidance_lastfm::direct::StorageScope::LocalArtistsOnly;
+    opts.library_db_path = Some(library.to_string_lossy().into_owned());
+    let (_, diagnostics) = DirectPrepared::prepare(&opts, &[anchor()]).unwrap();
+    server.join().unwrap();
+    assert_eq!(diagnostics.request_count, 2);
+    let store = bliss_guidance_lastfm::store::GraphStore::open(&graph).unwrap();
+    let id = store
+        .find_artist(&bliss_guidance_lastfm::store::ArtistIdentity {
+            name: "Seed Artist".into(),
+            mbid: Some("seed-artist".into()),
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(store.statistics().unwrap().library_artists, 2);
+    assert_eq!(
+        store.artist_observation(id).unwrap().unwrap().edges.len(),
+        1
+    );
+}
+
+#[test]
 fn online_fill_is_reused_by_a_new_offline_only_session() {
     let _guard = API_KEY_LOCK.lock().unwrap();
     std::env::set_var(API_KEY_ENVIRONMENT, "test-key");

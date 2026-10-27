@@ -288,6 +288,42 @@ impl GraphStore {
             .map_err(|error| format!("cannot commit Last.fm library membership: {error}"))
     }
 
+    pub fn refresh_library_membership(
+        &mut self,
+        snapshot_id: &str,
+        identities: &[ArtistIdentity],
+        now: i64,
+    ) -> Result<(), String> {
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|e| format!("cannot start library membership refresh: {e}"))?;
+        transaction
+            .execute("DELETE FROM library_artist_membership", [])
+            .map_err(|e| e.to_string())?;
+        transaction
+            .execute("DELETE FROM library_snapshots", [])
+            .map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO library_snapshots(snapshot_id, library_identity, created_at) VALUES (?1, ?1, ?2)", params![snapshot_id, now]).map_err(|e| e.to_string())?;
+        for identity in identities {
+            let id = resolve_or_create_artist_on(&transaction, identity, now)?;
+            transaction.execute("INSERT OR IGNORE INTO library_artist_membership(snapshot_id, artist_id) VALUES (?1, ?2)", params![snapshot_id, id]).map_err(|e| e.to_string())?;
+        }
+        transaction
+            .commit()
+            .map_err(|e| format!("cannot commit library membership refresh: {e}"))
+    }
+
+    pub fn library_membership_is_current(&self, identity: &str) -> Result<bool, String> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM library_snapshots WHERE library_identity = ?1)",
+                [identity],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("cannot inspect library membership: {e}"))
+    }
+
     pub fn checkpoint_and_compact(
         &mut self,
         artist_result_limit: u32,

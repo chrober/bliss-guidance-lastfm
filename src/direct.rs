@@ -75,6 +75,7 @@ fn push_log_event(
 pub struct DirectOptions {
     pub api_endpoint: String,
     pub store_path: String,
+    pub library_db_path: Option<String>,
     pub legacy_cache_path: Option<String>,
     pub retrieval_policy: RetrievalPolicy,
     pub artist_result_limit: ArtistLimit,
@@ -163,6 +164,11 @@ impl DirectOptions {
         Ok(Self {
             api_endpoint,
             store_path: store_path.to_owned(),
+            library_db_path: object
+                .get("library_db_path")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
             legacy_cache_path: object
                 .get("legacy_cache_path")
                 .and_then(Value::as_str)
@@ -581,6 +587,7 @@ impl DirectPrepared {
             failures,
         } = fetch_concurrently(options, &api_key, deadline, misses);
         request_count += batch_request_count;
+        let mut membership_ready: Option<bool> = None;
         for (task, response) in values {
             let key = task.key().to_owned();
             let result_count = match &response {
@@ -616,33 +623,50 @@ impl DirectPrepared {
                 );
             }
             if matches!(response, FetchResponse::Artist(_)) {
-                match persist_response(
-                    &mut store,
-                    &task,
-                    &response,
-                    now,
-                    options.storage_scope,
-                    Some(
-                        options
-                            .budget_bytes
-                            .saturating_sub(cache_usage.bytes(unix_seconds() as i64)?),
-                    ),
-                ) {
-                    Err(_) => persistence_failed += 1,
-                    Ok(true) => {}
-                    Ok(false) if wants_info(&options.diagnostic_level) => {
-                        push_log_event(
-                            &mut log_events,
-                            "info",
-                            "lastfm_persistence_skipped",
-                            Some(task.operation()),
-                            Some(task.source()),
-                            Some("budget_exhausted"),
-                            Some(result_count),
-                            Some(serde_json::json!({"budget_bytes": options.budget_bytes})),
-                        );
+                let may_persist = if options.storage_scope == StorageScope::LocalArtistsOnly {
+                    *membership_ready.get_or_insert_with(|| {
+                        options.library_db_path.as_deref().is_some_and(|path| {
+                            crate::library_membership::refresh(
+                                std::path::Path::new(path),
+                                std::path::Path::new(&options.store_path),
+                            )
+                            .is_ok()
+                        })
+                    })
+                } else {
+                    true
+                };
+                if !may_persist {
+                    persistence_failed += 1;
+                } else {
+                    match persist_response(
+                        &mut store,
+                        &task,
+                        &response,
+                        now,
+                        options.storage_scope,
+                        Some(
+                            options
+                                .budget_bytes
+                                .saturating_sub(cache_usage.bytes(unix_seconds() as i64)?),
+                        ),
+                    ) {
+                        Err(_) => persistence_failed += 1,
+                        Ok(true) => {}
+                        Ok(false) if wants_info(&options.diagnostic_level) => {
+                            push_log_event(
+                                &mut log_events,
+                                "info",
+                                "lastfm_persistence_skipped",
+                                Some(task.operation()),
+                                Some(task.source()),
+                                Some("budget_exhausted"),
+                                Some(result_count),
+                                Some(serde_json::json!({"budget_bytes": options.budget_bytes})),
+                            );
+                        }
+                        Ok(false) => {}
                     }
-                    Ok(false) => {}
                 }
             }
             match response {
@@ -695,6 +719,21 @@ impl DirectPrepared {
                 None,
                 Some(serde_json::json!({"error": error})),
             );
+        }
+        if !artist_queries.is_empty() && options.storage_scope != StorageScope::LocalArtistsOnly {
+            if let Some(library) = options.library_db_path.as_deref() {
+                if let Ok(exe) = std::env::current_exe() {
+                    let _ = std::process::Command::new(exe)
+                        .arg("refresh-library-membership")
+                        .arg(library)
+                        .arg(&options.store_path)
+                        .env_remove(API_KEY_ENVIRONMENT)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .spawn();
+                }
+            }
         }
         let mut relations_by_source = HashMap::new();
         for anchor in anchors {
