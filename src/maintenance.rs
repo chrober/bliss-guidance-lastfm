@@ -347,27 +347,34 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
 
 fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
     request.require_api_key()?;
-    let mut store = GraphStore::open(&request.store_path)?;
+    emit_json(
+        output,
+        &GraphProgress::new("compact", "Preparing offline artist database cleanup"),
+    )?;
+    let mut store = GraphStore::open_for_maintenance(&request.store_path)?;
     let mut cache_usage =
         crate::legacy_cache::CacheUsage::new(request.legacy_cache_path.as_deref());
     let cleanup = if let Some(path) = request.roots_path.as_deref() {
         let snapshot = LibraryArtistSnapshot::load(path)?;
+        emit_json(output, &GraphProgress::new("compact", "Checking artist records and repairing names; waiting for database access if necessary"))?;
         let report = store.cleanup_artist_records(&snapshot)?;
-        let mut artist_ids = Vec::with_capacity(snapshot.artists.len());
-        for root in &snapshot.artists {
-            artist_ids.push(store.resolve_or_create_artist(
-                &ArtistIdentity {
-                    mbid: root.artist_mbids.first().cloned(),
-                    name: root.name.clone(),
-                },
-                unix_seconds(),
-            )?);
-        }
-        store.replace_library_membership(
+        emit_json(
+            output,
+            &GraphProgress::new("compact", "Refreshing library artist membership"),
+        )?;
+        let identities: Vec<_> = snapshot
+            .artists
+            .iter()
+            .map(|root| ArtistIdentity {
+                mbid: root.artist_mbids.first().cloned(),
+                name: root.name.clone(),
+            })
+            .collect();
+        store.refresh_library_membership_with_identity(
             &snapshot.snapshot_id,
             &snapshot.library_identity,
+            &identities,
             snapshot.generated_at,
-            &artist_ids,
         )?;
         Some(report)
     } else {
@@ -375,7 +382,8 @@ fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String
     };
     let limit = request.artist_limit()?.value();
     let local_only = request.storage_scope()? == StorageScope::LocalArtistsOnly;
-    store.checkpoint_and_compact(limit, local_only)?;
+    emit_json(output, &GraphProgress::new("compact", "Removing out-of-scope relations and compacting the database; waiting for database access if necessary"))?;
+    let removed_after_trim = store.checkpoint_and_compact(limit, local_only)?;
     let statistics = store.statistics()?;
     emit_json(
         output,
@@ -386,7 +394,7 @@ fn compact(request: &GraphRequest, output: &mut impl Write) -> Result<(), String
             "retained_lastfm_bytes":retained_storage_bytes(&store, &mut cache_usage)?,
             "artist_edges":statistics.artist_edges,
             "repaired_names":cleanup.as_ref().map_or(0, |result| result.repaired_names),
-            "removed_orphans":cleanup.as_ref().map_or(0, |result| result.removed_orphans),
+            "removed_orphans":cleanup.as_ref().map_or(0, |result| result.removed_orphans) + removed_after_trim,
             "ambiguous_names":cleanup.as_ref().map_or(0, |result| result.ambiguous_names),
         }),
     )

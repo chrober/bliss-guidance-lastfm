@@ -5,12 +5,16 @@ use rusqlite::Connection;
 pub const SCHEMA_VERSION: i64 = 2;
 pub const BUSY_TIMEOUT_MILLIS: i64 = 5_000;
 
-pub fn initialize(connection: &Connection, created_at: i64) -> Result<(), String> {
+pub fn initialize(
+    connection: &Connection,
+    created_at: i64,
+    busy_timeout_millis: i64,
+) -> Result<(), String> {
     connection
         .execute_batch(&format!(
             r#"
             PRAGMA foreign_keys = ON;
-            PRAGMA busy_timeout = {BUSY_TIMEOUT_MILLIS};
+            PRAGMA busy_timeout = {busy_timeout_millis};
             PRAGMA journal_mode = WAL;
 
             CREATE TABLE IF NOT EXISTS metadata (

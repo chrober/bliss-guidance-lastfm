@@ -159,13 +159,25 @@ impl GraphStore {
     }
 
     pub fn open_at(path: impl AsRef<Path>, created_at: i64) -> Result<Self, String> {
+        Self::open_at_with_timeout(path, created_at, schema::BUSY_TIMEOUT_MILLIS)
+    }
+
+    pub fn open_for_maintenance(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::open_at_with_timeout(path, unix_seconds(), 30_000)
+    }
+
+    fn open_at_with_timeout(
+        path: impl AsRef<Path>,
+        created_at: i64,
+        timeout_millis: i64,
+    ) -> Result<Self, String> {
         if let Some(parent) = path.as_ref().parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("cannot create Last.fm graph directory: {error}"))?;
         }
         let connection = Connection::open(path)
             .map_err(|error| format!("cannot open Last.fm graph database: {error}"))?;
-        schema::initialize(&connection, created_at)?;
+        schema::initialize(&connection, created_at, timeout_millis)?;
         backfill_retained_payload_bytes(&connection)?;
         Ok(Self { connection })
     }
@@ -294,9 +306,19 @@ impl GraphStore {
         identities: &[ArtistIdentity],
         now: i64,
     ) -> Result<(), String> {
+        self.refresh_library_membership_with_identity(snapshot_id, snapshot_id, identities, now)
+    }
+
+    pub fn refresh_library_membership_with_identity(
+        &mut self,
+        snapshot_id: &str,
+        library_identity: &str,
+        identities: &[ArtistIdentity],
+        now: i64,
+    ) -> Result<(), String> {
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("cannot start library membership refresh: {e}"))?;
         transaction
             .execute("DELETE FROM library_artist_membership", [])
@@ -304,7 +326,7 @@ impl GraphStore {
         transaction
             .execute("DELETE FROM library_snapshots", [])
             .map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO library_snapshots(snapshot_id, library_identity, created_at) VALUES (?1, ?1, ?2)", params![snapshot_id, now]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO library_snapshots(snapshot_id, library_identity, created_at) VALUES (?1, ?2, ?3)", params![snapshot_id, library_identity, now]).map_err(|e| e.to_string())?;
         for identity in identities {
             let id = resolve_or_create_artist_on(&transaction, identity, now)?;
             transaction.execute("INSERT OR IGNORE INTO library_artist_membership(snapshot_id, artist_id) VALUES (?1, ?2)", params![snapshot_id, id]).map_err(|e| e.to_string())?;
@@ -328,10 +350,13 @@ impl GraphStore {
         &mut self,
         artist_result_limit: u32,
         local_artists_only: bool,
-    ) -> Result<(), String> {
-        let transaction = self.connection.transaction().map_err(|error| {
-            format!("cannot start Last.fm graph compaction transaction: {error}")
-        })?;
+    ) -> Result<usize, String> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                format!("cannot start Last.fm graph compaction transaction: {error}")
+            })?;
         if artist_result_limit > 0 {
             transaction
                 .execute(
@@ -341,6 +366,19 @@ impl GraphStore {
                 .map_err(|error| format!("cannot trim Last.fm artist edges: {error}"))?;
         }
         if local_artists_only {
+            let has_snapshot: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM library_snapshots)",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("cannot inspect Last.fm library snapshot: {error}"))?;
+            if !has_snapshot {
+                return Err("cannot apply local-only cleanup without a library snapshot".to_owned());
+            }
+            transaction.execute(
+                "DELETE FROM artist_queries WHERE source_artist_id NOT IN (SELECT artist_id FROM library_artist_membership WHERE snapshot_id = (SELECT snapshot_id FROM library_snapshots ORDER BY created_at DESC, snapshot_id DESC LIMIT 1))", [],
+            ).map_err(|error| format!("cannot trim non-library Last.fm artist queries: {error}"))?;
             transaction
                 .execute(
                     "DELETE FROM artist_similarity_edges WHERE target_artist_id NOT IN (SELECT artist_id FROM library_artist_membership WHERE snapshot_id = (SELECT snapshot_id FROM library_snapshots ORDER BY created_at DESC, snapshot_id DESC LIMIT 1))",
@@ -348,13 +386,21 @@ impl GraphStore {
                 )
                 .map_err(|error| format!("cannot trim non-library Last.fm artist edges: {error}"))?;
         }
+        let removed = if local_artists_only {
+            transaction.execute(
+            "DELETE FROM artists WHERE NOT EXISTS (SELECT 1 FROM library_artist_membership m WHERE m.artist_id = artists.artist_id) AND NOT EXISTS (SELECT 1 FROM artist_queries q WHERE q.source_artist_id = artists.artist_id) AND NOT EXISTS (SELECT 1 FROM artist_similarity_edges e WHERE e.target_artist_id = artists.artist_id)", [],
+        ).map_err(|error| format!("cannot remove orphaned Last.fm artists: {error}"))?
+        } else {
+            0
+        };
         recalculate_all_artist_payload_bytes(&transaction)?;
         transaction
             .commit()
             .map_err(|error| format!("cannot commit Last.fm graph compaction: {error}"))?;
         self.connection
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;")
-            .map_err(|error| format!("cannot compact Last.fm graph: {error}"))
+            .map_err(|error| format!("cannot compact Last.fm graph: {error}"))?;
+        Ok(removed)
     }
 
     pub fn cleanup_artist_records(
@@ -364,7 +410,7 @@ impl GraphStore {
         snapshot.validate()?;
         let transaction = self
             .connection
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|e| format!("cannot start artist cleanup: {e}"))?;
         let mut by_mojibake: HashMap<String, Vec<&crate::root_snapshot::LibraryArtistRoot>> =
             HashMap::new();

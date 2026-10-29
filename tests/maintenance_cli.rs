@@ -267,7 +267,18 @@ fn compact_uses_current_library_snapshot_and_reports_targeted_cleanup() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let events: Vec<Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(
+        events.iter().any(|event| event["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty())),
+        "cleanup must report its progress before finishing"
+    );
+    let result = events.last().unwrap();
     assert_eq!(result["repaired_names"], 1);
     assert_eq!(result["removed_orphans"], 1);
     let store = GraphStore::open(&store_path).unwrap();
@@ -280,6 +291,128 @@ fn compact_uses_current_library_snapshot_and_reports_targeted_cleanup() {
     let _ = fs::remove_file(request_path);
     let _ = fs::remove_file(roots_path);
     let _ = fs::remove_file(store_path);
+}
+
+#[test]
+fn local_only_cleanup_removes_unreferenced_same_name_and_trimmed_artists() {
+    use bliss_guidance_lastfm::store::{
+        ArtistEdgeWrite, ArtistObservationWrite, GraphStore, ObservationStatus,
+    };
+    let store_path = temp_path("cleanup-local", "sqlite");
+    let roots_path = temp_path("cleanup-local-roots", "json");
+    let mut store = GraphStore::open(&store_path).unwrap();
+    let local = store
+        .upsert_artist(Some("local-id"), "Shared Name", 10)
+        .unwrap();
+    let duplicate = store
+        .upsert_artist(Some("external-id"), "Shared Name", 10)
+        .unwrap();
+    let target = store.upsert_artist(None, "External target", 10).unwrap();
+    store
+        .replace_library_membership("old", "old", 10, &[local])
+        .unwrap();
+    store
+        .replace_artist_observation(
+            local,
+            &ArtistObservationWrite {
+                fetched_at: 10,
+                validated_at: 10,
+                changed_at: 10,
+                expires_at: 100,
+                etag: None,
+                last_modified: None,
+                payload_hash: "fixture".into(),
+                acquisition_source: "api_key".into(),
+                requested_limit: 25,
+                actual_result_count: 1,
+                result_status: ObservationStatus::Positive,
+            },
+            &[ArtistEdgeWrite {
+                target_artist_id: target,
+                rank: 1,
+                match_score: Some(0.8),
+            }],
+        )
+        .unwrap();
+    store
+        .replace_artist_observation(
+            duplicate,
+            &ArtistObservationWrite {
+                fetched_at: 10,
+                validated_at: 10,
+                changed_at: 10,
+                expires_at: 100,
+                etag: None,
+                last_modified: None,
+                payload_hash: "external".into(),
+                acquisition_source: "api_key".into(),
+                requested_limit: 25,
+                actual_result_count: 0,
+                result_status: ObservationStatus::Empty,
+            },
+            &[],
+        )
+        .unwrap();
+    drop(store);
+    fs::write(&roots_path, serde_json::to_vec(&serde_json::json!({
+        "kind":"lastfm-library-artist-roots-v1", "snapshot_id":"fresh", "library_identity":"l", "generated_at":20,
+        "artists":[{"lms_contributor_id":1,"name":"Shared Name","artist_mbids":["local-id"]}]
+    })).unwrap()).unwrap();
+    let request_path = request(
+        &store_path,
+        serde_json::json!({"acquisition_mode":"direct", "roots_path":roots_path, "storage_scope":"local_artists_only"}),
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .args(["graph", "compact", "--request"])
+        .arg(&request_path)
+        .env("BLISS_GUIDANCE_LASTFM_API_KEY", "fixture")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let store = GraphStore::open(&store_path).unwrap();
+    assert!(store.artist(local).unwrap().is_some());
+    assert!(store.artist(duplicate).unwrap().is_none());
+    assert!(store.artist(target).unwrap().is_none());
+    assert_eq!(store.statistics().unwrap().external_artists, 0);
+}
+
+#[test]
+fn cleanup_reports_progress_while_waiting_for_another_database_writer() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let store_path = temp_path("locked-cleanup", "sqlite");
+    drop(bliss_guidance_lastfm::store::GraphStore::open(&store_path).unwrap());
+    let connection = rusqlite::Connection::open(&store_path).unwrap();
+    connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let request_path = request(
+        &store_path,
+        serde_json::json!({"acquisition_mode":"direct"}),
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .args(["graph", "compact", "--request"])
+        .arg(&request_path)
+        .env("BLISS_GUIDANCE_LASTFM_API_KEY", "fixture")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    reader.read_line(&mut first).unwrap();
+    let event: Value = serde_json::from_str(&first).unwrap();
+    assert!(event["message"]
+        .as_str()
+        .is_some_and(|message| !message.is_empty()));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "cleanup waits while another writer holds the database"
+    );
+    std::thread::sleep(std::time::Duration::from_secs(6));
+    connection.execute_batch("ROLLBACK").unwrap();
+    assert!(child.wait().unwrap().success());
 }
 
 #[test]

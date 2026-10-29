@@ -471,6 +471,15 @@ fn library_membership_tolerates_duplicate_canonical_artist_ids() {
 }
 
 #[test]
+fn local_only_compaction_requires_a_membership_snapshot() {
+    let path = database_path("compact-missing-snapshot");
+    let mut store = GraphStore::open(&path).unwrap();
+    let artist = store.upsert_artist(None, "Existing artist", 1).unwrap();
+    assert!(store.checkpoint_and_compact(25, true).is_err());
+    assert!(store.artist(artist).unwrap().is_some());
+}
+
+#[test]
 fn compaction_applies_the_current_result_limit_and_local_artist_scope() {
     let path = database_path("compact-scope");
     let mut store = GraphStore::open(&path).unwrap();
