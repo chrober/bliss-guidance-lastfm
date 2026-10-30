@@ -46,7 +46,7 @@ pub struct Validators {
     pub last_modified: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseHeaders {
     pub cache_control: Option<String>,
     pub expires: Option<String>,
@@ -54,13 +54,13 @@ pub struct ResponseHeaders {
     pub last_modified: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ResponseStatus {
     Modified,
     NotModified,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ResponseEnvelope<T> {
     pub status: ResponseStatus,
     pub results: Vec<T>,

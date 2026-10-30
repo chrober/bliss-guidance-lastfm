@@ -3,7 +3,7 @@
 use super::schema;
 use super::{normalize_name, ArtistIdentity};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,7 +15,7 @@ pub struct ArtistCleanupReport {
     pub ambiguous_names: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ObservationStatus {
     Positive,
     Empty,
@@ -71,14 +71,14 @@ pub struct ArtistEdgeWrite {
     pub match_score: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArtistEdgeRecord {
     pub target_artist_id: i64,
     pub rank: u32,
     pub match_score: Option<f64>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ArtistObservationRecord {
     pub source_artist_id: i64,
     pub fetched_at: i64,

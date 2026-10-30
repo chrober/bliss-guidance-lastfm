@@ -200,6 +200,7 @@ pub struct DirectPrepared {
     pub request_count: u64,
     pub cache_hits: u64,
     pub failure_count: u64,
+    pending_writes: Vec<(FetchTask, FetchResponse)>,
 }
 
 #[derive(Clone, Debug)]
@@ -210,7 +211,7 @@ struct DirectRelation {
     artist: Option<SimilarArtist>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum FetchTask {
     Track {
         key: String,
@@ -227,7 +228,7 @@ enum FetchTask {
     },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 enum FetchResponse {
     Track(ResponseEnvelope<SimilarTrack>),
     Artist(ResponseEnvelope<SimilarArtist>),
@@ -348,9 +349,28 @@ impl FetchTask {
 }
 
 impl DirectPrepared {
+    pub fn take_pending_writes(&mut self) -> Result<Value, String> {
+        serde_json::to_value(std::mem::take(&mut self.pending_writes))
+            .map_err(|error| format!("cannot encode pending Last.fm writes: {error}"))
+    }
     pub fn prepare(
         options: &DirectOptions,
         anchors: &[Anchor],
+    ) -> Result<(Self, Diagnostics), String> {
+        Self::prepare_impl(options, anchors, false)
+    }
+
+    pub fn prepare_deferred(
+        options: &DirectOptions,
+        anchors: &[Anchor],
+    ) -> Result<(Self, Diagnostics), String> {
+        Self::prepare_impl(options, anchors, true)
+    }
+
+    fn prepare_impl(
+        options: &DirectOptions,
+        anchors: &[Anchor],
+        defer_writes: bool,
     ) -> Result<(Self, Diagnostics), String> {
         let prepare_started = Instant::now();
         let api_key = options.api_key_from_environment()?;
@@ -474,14 +494,20 @@ impl DirectPrepared {
         }
         let mut artists = HashMap::<String, Vec<SimilarArtist>>::new();
         for (key, (artist, mbid)) in &artist_queries {
-            let source_id = store.resolve_or_create_artist(
-                &ArtistIdentity {
-                    mbid: mbid.clone(),
-                    name: artist.clone(),
-                },
-                now,
-            )?;
-            let existing = store.artist_observation(source_id)?;
+            let identity = ArtistIdentity {
+                mbid: mbid.clone(),
+                name: artist.clone(),
+            };
+            let source_id = if defer_writes {
+                store.find_artist(&identity)?.unwrap_or(0)
+            } else {
+                store.resolve_or_create_artist(&identity, now)?
+            };
+            let existing = if source_id == 0 {
+                None
+            } else {
+                store.artist_observation(source_id)?
+            };
             let task = FetchTask::Artist {
                 key: key.clone(),
                 source_id,
@@ -593,6 +619,7 @@ impl DirectPrepared {
         request_count += batch_request_count;
         let mut local_library: Option<Result<crate::library_membership::LocalLibrary, String>> =
             None;
+        let mut pending_writes = Vec::new();
         for (task, response) in values {
             let key = task.key().to_owned();
             let result_count = match &response {
@@ -627,7 +654,10 @@ impl DirectPrepared {
                     Some(serde_json::json!({"results": debug_results})),
                 );
             }
-            if matches!(response, FetchResponse::Artist(_)) {
+            if defer_writes {
+                pending_writes.push((task.clone(), response.clone()));
+            }
+            if !defer_writes && matches!(response, FetchResponse::Artist(_)) {
                 if options.storage_scope == StorageScope::LocalArtistsOnly
                     && local_library.is_none()
                 {
@@ -683,7 +713,11 @@ impl DirectPrepared {
             }
             match response {
                 FetchResponse::Track(value) => {
-                    if let Some(path) = options.legacy_cache_path.as_deref() {
+                    if let Some(path) = options
+                        .legacy_cache_path
+                        .as_deref()
+                        .filter(|_| !defer_writes)
+                    {
                         let graph_bytes = store.retained_lastfm_bytes()?;
                         match crate::legacy_cache::cache_tracks_with_budget(
                             path,
@@ -785,6 +819,7 @@ impl DirectPrepared {
             request_count,
             cache_hits,
             failure_count: failed_requests,
+            pending_writes,
         };
         let relation_count = prepared
             .relations_by_source
@@ -937,6 +972,82 @@ fn stored_artists(
             })
         })
         .collect()
+}
+
+pub fn persist_pending_writes(options: &DirectOptions, pending: Value) -> Result<(), String> {
+    let writes: Vec<(FetchTask, FetchResponse)> = serde_json::from_value(pending)
+        .map_err(|error| format!("invalid pending Last.fm writes: {error}"))?;
+    let now = unix_seconds() as i64;
+    let mut store = GraphStore::open_at(&options.store_path, now)?;
+    let mut cache = crate::legacy_cache::CacheUsage::new(options.legacy_cache_path.as_deref());
+    let library = if options.storage_scope == StorageScope::LocalArtistsOnly {
+        Some(crate::library_membership::LocalLibrary::load(
+            std::path::Path::new(
+                options
+                    .library_db_path
+                    .as_deref()
+                    .ok_or("Lyrion library database is unavailable")?,
+            ),
+        )?)
+    } else {
+        None
+    };
+    for (mut task, response) in writes {
+        match &response {
+            FetchResponse::Artist(_) => {
+                if let FetchTask::Artist {
+                    source_id,
+                    artist,
+                    artist_mbid,
+                    existing,
+                    ..
+                } = &mut task
+                {
+                    *source_id = store.resolve_or_create_artist(
+                        &ArtistIdentity {
+                            name: artist.clone(),
+                            mbid: artist_mbid.clone(),
+                        },
+                        now,
+                    )?;
+                    *existing = store.artist_observation(*source_id)?;
+                }
+                let stored = persist_response(
+                    &mut store,
+                    &task,
+                    &response,
+                    now,
+                    options.storage_scope,
+                    library.as_ref(),
+                    Some(options.budget_bytes.saturating_sub(cache.bytes(now)?)),
+                )?;
+                if !stored {
+                    return Err(
+                        "Last.fm artist result exceeded the configured storage limit".into(),
+                    );
+                }
+            }
+            FetchResponse::Track(value) => {
+                if let Some(path) = options.legacy_cache_path.as_deref() {
+                    let stored = crate::legacy_cache::cache_tracks_with_budget(
+                        path,
+                        task.key(),
+                        now,
+                        &value.results,
+                        options
+                            .budget_bytes
+                            .saturating_sub(store.retained_lastfm_bytes()?),
+                    )?;
+                    if !stored {
+                        return Err(
+                            "Last.fm track cache exceeded the configured storage limit".into()
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn persist_response(

@@ -75,6 +75,7 @@ struct Provider {
     snapshot_id: Option<String>,
     prepared: bool,
     diagnostic_level: String,
+    pending_persistence: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -287,58 +288,16 @@ impl Provider {
     ) -> Result<(Option<String>, Diagnostics), String> {
         self.edges.clear();
         self.artist_sources_by_track.clear();
-        let original_options = options;
-        let mut options = direct::DirectOptions::from_prepare_options(options)?;
-        self.diagnostic_level = options.diagnostic_level.clone();
-        let offline_preferred =
-            options.retrieval_policy == direct::RetrievalPolicy::OfflinePreferred;
-        if offline_preferred {
-            options.retrieval_policy = direct::RetrievalPolicy::OfflineOnly;
-        }
-        let (prepared, mut diagnostics) = direct::DirectPrepared::prepare(&options, anchors)?;
-        if offline_preferred {
-            let needs_refresh = diagnostics.details.as_ref().is_some_and(|details| {
-                details["missing"].as_u64().unwrap_or(0) > 0
-                    || details["stale_offline"].as_u64().unwrap_or(0) > 0
-            });
-            let refresh = if needs_refresh {
-                match spawn_background_refresh(original_options, anchors) {
-                    Ok(()) => "started",
-                    Err(_) => "failed_to_start",
-                }
-            } else {
-                "not_needed"
-            };
-            if let Some(details) = diagnostics
-                .details
-                .as_mut()
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                details.insert("background_refresh".to_owned(), serde_json::json!(refresh));
-                if refresh == "failed_to_start"
-                    || (refresh == "started" && wants_info(&self.diagnostic_level))
-                {
-                    if let Some(events) = details
-                        .get_mut("log_events_v1")
-                        .and_then(serde_json::Value::as_array_mut)
-                    {
-                        events.push(provider_log_event(
-                            if refresh == "failed_to_start" {
-                                "warning"
-                            } else {
-                                "info"
-                            },
-                            "prepare",
-                            "lastfm_background_refresh",
-                            None,
-                            None,
-                            None,
-                            Some(serde_json::json!({"state": refresh})),
-                        ));
-                    }
-                }
-            }
-        }
+        let parsed = direct::DirectOptions::from_prepare_options(options)?;
+        self.diagnostic_level = parsed.diagnostic_level.clone();
+        let (mut prepared, diagnostics) =
+            direct::DirectPrepared::prepare_deferred(&parsed, anchors)?;
+        let writes = prepared.take_pending_writes()?;
+        self.pending_persistence = if writes.as_array().is_some_and(|items| !items.is_empty()) {
+            Some(serde_json::json!({"options": options, "writes": writes}))
+        } else {
+            None
+        };
         let snapshot_id = format!(
             "direct:sources:{}:requests:{}:cache_hits:{}",
             anchors.len(),
@@ -491,14 +450,12 @@ impl Provider {
     }
 }
 
-fn spawn_background_refresh(
-    options: &serde_json::Value,
-    anchors: &[bliss_playlist_guidance_spi::Anchor],
-) -> Result<(), String> {
-    let payload = serde_json::to_vec(&serde_json::json!({"options": options, "anchors": anchors}))
+fn spawn_background_persistence(pending: &serde_json::Value) -> Result<(), String> {
+    let payload = serde_json::to_vec(pending)
         .map_err(|error| format!("cannot encode background refresh: {error}"))?;
     let mut child = std::process::Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
-        .arg("refresh-guidance-background")
+        .arg("persist-guidance-background")
+        .env_remove(direct::API_KEY_ENVIRONMENT)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -515,28 +472,53 @@ fn spawn_background_refresh(
     Ok(())
 }
 
-fn run_background_refresh() -> Result<(), String> {
+fn run_background_persistence() -> Result<(), String> {
     use fs2::FileExt;
     let payload: serde_json::Value = serde_json::from_reader(io::stdin().lock())
         .map_err(|error| format!("invalid background refresh input: {error}"))?;
-    let mut options = direct::DirectOptions::from_prepare_options(&payload["options"])?;
-    let anchors: Vec<bliss_playlist_guidance_spi::Anchor> =
-        serde_json::from_value(payload["anchors"].clone())
-            .map_err(|error| format!("invalid background refresh anchors: {error}"))?;
-    let lock_path =
-        std::path::Path::new(&options.store_path).with_extension("guidance-refresh.lock");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(lock_path)
-        .map_err(|error| format!("cannot open refresh lock: {error}"))?;
-    // Wait only in the detached, low-priority worker. Dropping a concurrent
-    // refresh would silently lose a different job's missing artist lookups.
-    lock.lock_exclusive().map_err(|error| error.to_string())?;
-    options.retrieval_policy = direct::RetrievalPolicy::OnlineWithCache;
-    direct::DirectPrepared::prepare(&options, &anchors).map(|_| ())
+    let options = direct::DirectOptions::from_prepare_options(&payload["options"])?;
+    let result = (|| {
+        let lock_path =
+            std::path::Path::new(&options.store_path).with_extension("guidance-refresh.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)
+            .map_err(|error| format!("cannot open refresh lock: {error}"))?;
+        // Wait only in the detached, low-priority worker. Dropping a concurrent
+        // refresh would silently lose a different job's missing artist lookups.
+        lock.lock_exclusive().map_err(|error| error.to_string())?;
+        direct::persist_pending_writes(&options, payload["writes"].clone())
+    })();
+    if let Err(error) = &result {
+        let _ = report_persistence_error(&options.store_path, error);
+    }
+    result
+}
+
+fn report_persistence_error(store_path: &str, error: &str) -> Result<(), String> {
+    let parent = std::path::Path::new(store_path)
+        .parent()
+        .ok_or("missing graph directory")?;
+    let dir = parent.join("persistence-errors");
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_nanos();
+    let stem = format!("error-{}-{stamp}", std::process::id());
+    let temporary = dir.join(format!("{stem}.tmp"));
+    let final_path = dir.join(format!("{stem}.json"));
+    let safe_error: String = error.chars().take(512).collect();
+    std::fs::write(
+        &temporary,
+        serde_json::to_vec(&serde_json::json!({"error": safe_error}))
+            .map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    std::fs::rename(temporary, final_path).map_err(|error| error.to_string())
 }
 
 fn diagnostic_level(options: &serde_json::Value) -> &str {
@@ -657,12 +639,12 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => {}
-        [command] if command == "refresh-guidance-background" => {
+        [command] if command == "persist-guidance-background" => {
             #[cfg(unix)]
             unsafe {
                 libc::setpriority(libc::PRIO_PROCESS, 0, 10);
             }
-            if run_background_refresh().is_err() {
+            if run_background_persistence().is_err() {
                 std::process::exit(1);
             }
             return;
@@ -744,6 +726,13 @@ fn main() {
         }
         if stdout.flush().is_err() {
             break;
+        }
+        if let Some(pending) = provider.pending_persistence.take() {
+            if let Err(error) = spawn_background_persistence(&pending) {
+                if let Some(path) = pending["options"]["store_path"].as_str() {
+                    let _ = report_persistence_error(path, &error);
+                }
+            }
         }
         if matches!(response, GuidanceResponse::Closed { .. }) {
             break;

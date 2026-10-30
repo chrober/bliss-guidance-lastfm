@@ -65,7 +65,7 @@ fn candidate() -> Candidate {
 }
 
 #[test]
-fn offline_preferred_returns_before_slow_network_and_refreshes_after_host_closes() {
+fn offline_preferred_fetches_missing_artist_for_current_job_and_persists_it() {
     use bliss_playlist_guidance_spi::{GuidanceRequest, GuidanceResponse, SPI_VERSION};
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
@@ -81,7 +81,7 @@ fn offline_preferred_returns_before_slow_network_and_refreshes_after_host_closes
                 Ok((mut stream, _)) => {
                     let mut request = [0_u8; 8192];
                     let _ = stream.read(&mut request).unwrap();
-                    thread::sleep(Duration::from_millis(1500));
+                    thread::sleep(Duration::from_millis(150));
                     let body = r#"{"similarartists":{"artist":[{"name":"Related Artist","mbid":"related-artist","match":"0.8"}]}}"#;
                     write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
                     return true;
@@ -122,19 +122,47 @@ fn offline_preferred_returns_before_slow_network_and_refreshes_after_host_closes
     )
     .unwrap();
     let mut response = String::new();
-    BufReader::new(child.stdout.take().unwrap())
-        .read_line(&mut response)
-        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    reader.read_line(&mut response).unwrap();
     let elapsed = start.elapsed();
-    assert!(matches!(
-        serde_json::from_str::<GuidanceResponse>(&response).unwrap(),
-        GuidanceResponse::Prepared { .. }
-    ));
+    match serde_json::from_str::<GuidanceResponse>(&response).unwrap() {
+        GuidanceResponse::Prepared { diagnostics, .. } => assert_eq!(
+            diagnostics.request_count, 1,
+            "the current job must wait for its missing artist lookup"
+        ),
+        other => panic!("expected prepared response, got {other:?}"),
+    }
+    let score = GuidanceRequest::Score {
+        spi_version: SPI_VERSION,
+        request_id: "score-fixture".into(),
+        context: ScoreContext {
+            scope: GuidanceScope::Edge,
+            left_anchor_id: Some("seed".into()),
+            right_anchor_id: None,
+            context_track_ids: vec![],
+        },
+        candidates: vec![candidate()],
+    };
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        serde_json::to_string(&score).unwrap()
+    )
+    .unwrap();
+    response.clear();
+    reader.read_line(&mut response).unwrap();
+    match serde_json::from_str::<GuidanceResponse>(&response).unwrap() {
+        GuidanceResponse::Scores { signals, .. } => assert!(
+            !signals.is_empty(),
+            "online similarity must influence the current job"
+        ),
+        other => panic!("expected scores, got {other:?}"),
+    }
     drop(child.stdin.take());
     child.wait().unwrap();
     assert!(
         elapsed < Duration::from_millis(1000),
-        "cached response waited {elapsed:?} for slow network"
+        "the online response took unexpectedly long: {elapsed:?}"
     );
     assert!(
         server.join().unwrap(),
@@ -148,9 +176,8 @@ fn offline_preferred_returns_before_slow_network_and_refreshes_after_host_closes
                 name: "Seed Artist".into(),
                 mbid: Some("seed-artist".into()),
             })
-            .unwrap()
             .unwrap();
-        if graph.artist_observation(id).unwrap().is_some() {
+        if id.is_some_and(|id| graph.artist_observation(id).unwrap().is_some()) {
             break;
         }
         assert!(
@@ -159,6 +186,103 @@ fn offline_preferred_returns_before_slow_network_and_refreshes_after_host_closes
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn locked_database_does_not_delay_online_guidance_response() {
+    use bliss_playlist_guidance_spi::{GuidanceRequest, GuidanceResponse, SPI_VERSION};
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let store = store_path();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let database = store.clone();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 8192];
+        let _ = stream.read(&mut request).unwrap();
+        let lock = rusqlite::Connection::open(database).unwrap();
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let body = r#"{"similarartists":{"artist":[{"name":"Related Artist","mbid":"related-artist","match":"0.8"}]}}"#;
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+        thread::sleep(Duration::from_millis(2500));
+        lock.execute_batch("ROLLBACK").unwrap();
+    });
+    let mut seed = anchor();
+    seed.track.title = None;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .env(API_KEY_ENVIRONMENT, "test-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request = GuidanceRequest::Prepare {
+        spi_version: SPI_VERSION,
+        job_id: "locked-fixture".into(),
+        options: serde_json::json!({"acquisition_mode":"direct", "api_endpoint":endpoint,
+            "store_path":store, "retrieval_policy":"offline_preferred", "request_deadline_ms":3000, "max_concurrent_requests":1}),
+        artifacts: vec![],
+        resources: vec![],
+        anchors: vec![seed],
+    };
+    let start = Instant::now();
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        serde_json::to_string(&request).unwrap()
+    )
+    .unwrap();
+    let mut response = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut response)
+        .unwrap();
+    let elapsed = start.elapsed();
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    server.join().unwrap();
+    assert!(matches!(
+        serde_json::from_str::<GuidanceResponse>(&response).unwrap(),
+        GuidanceResponse::Prepared { .. }
+    ));
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "database persistence delayed the response by {elapsed:?}"
+    );
+}
+
+#[test]
+fn failed_background_persistence_leaves_a_report_for_lyrion() {
+    use std::process::{Command, Stdio};
+    let directory = store_path().with_extension("fixture-dir");
+    std::fs::create_dir(&directory).unwrap();
+    let graph = directory.join("graph.sqlite");
+    std::fs::create_dir(&graph).unwrap();
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .arg("persist-guidance-background")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = serde_json::json!({"options": {"acquisition_mode":"direct",
+        "store_path":graph, "request_deadline_ms":1000, "max_concurrent_requests":1}, "writes":[]});
+    worker
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&payload).unwrap().as_bytes())
+        .unwrap();
+    assert!(!worker.wait().unwrap().success());
+    let entries: Vec<_> = std::fs::read_dir(directory.join("persistence-errors"))
+        .unwrap()
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one durable error report is available to the Lyrion logger"
+    );
+    let report = std::fs::read(entries[0].as_ref().unwrap().path()).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&report).unwrap();
+    assert!(value["error"].as_str().unwrap().contains("Last.fm"));
 }
 
 #[test]
@@ -306,6 +430,67 @@ fn offline_only_missing_data_is_neutral_and_makes_no_request() {
     std::env::remove_var(API_KEY_ENVIRONMENT);
     let _ = std::fs::remove_file(&store);
     let _ = std::fs::remove_file(store.with_extension("json"));
+}
+
+#[test]
+fn stale_artist_data_remains_usable_when_online_refresh_fails() {
+    use bliss_guidance_lastfm::store::{
+        ArtistEdgeWrite, ArtistObservationWrite, GraphStore, ObservationStatus,
+    };
+    let _guard = API_KEY_LOCK.lock().unwrap();
+    std::env::set_var(API_KEY_ENVIRONMENT, "test-key");
+    let path = store_path();
+    let mut graph = GraphStore::open(&path).unwrap();
+    let source = graph
+        .upsert_artist(Some("seed-artist"), "Seed Artist", 1)
+        .unwrap();
+    let target = graph
+        .upsert_artist(Some("related-artist"), "Related Artist", 1)
+        .unwrap();
+    graph
+        .replace_artist_observation(
+            source,
+            &ArtistObservationWrite {
+                fetched_at: 1,
+                validated_at: 1,
+                changed_at: 1,
+                expires_at: 2,
+                etag: None,
+                last_modified: None,
+                payload_hash: "fixture".into(),
+                acquisition_source: "api_key".into(),
+                requested_limit: 25,
+                actual_result_count: 1,
+                result_status: ObservationStatus::Positive,
+            },
+            &[ArtistEdgeWrite {
+                target_artist_id: target,
+                rank: 1,
+                match_score: Some(0.8),
+            }],
+        )
+        .unwrap();
+    drop(graph);
+    let mut seed = anchor();
+    seed.track.title = None;
+    let (prepared, diagnostics) = DirectPrepared::prepare_deferred(
+        &options("http://127.0.0.1:9", &path, "offline_preferred"),
+        &[seed],
+    )
+    .unwrap();
+    assert!(diagnostics.failure_count > 0);
+    let context = ScoreContext {
+        scope: GuidanceScope::Edge,
+        left_anchor_id: Some("seed".into()),
+        right_anchor_id: None,
+        context_track_ids: vec![],
+    };
+    assert_eq!(
+        prepared.signals(&context, &[candidate()]).len(),
+        1,
+        "the existing artist relation survives the failed request"
+    );
+    std::env::remove_var(API_KEY_ENVIRONMENT);
 }
 
 #[test]
