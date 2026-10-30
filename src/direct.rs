@@ -352,6 +352,7 @@ impl DirectPrepared {
         options: &DirectOptions,
         anchors: &[Anchor],
     ) -> Result<(Self, Diagnostics), String> {
+        let prepare_started = Instant::now();
         let api_key = options.api_key_from_environment()?;
         let now = unix_seconds() as i64;
         let deadline = Instant::now() + Duration::from_millis(options.request_deadline_ms);
@@ -580,12 +581,15 @@ impl DirectPrepared {
             }
         }
 
+        let local_lookup_ms = prepare_started.elapsed().as_millis() as u64;
+        let online_started = Instant::now();
         let FetchBatch {
             values,
             request_count: batch_request_count,
             failure_count: failed_requests,
             failures,
         } = fetch_concurrently(options, &api_key, deadline, misses);
+        let online_fetch_ms = online_started.elapsed().as_millis() as u64;
         request_count += batch_request_count;
         let mut local_library: Option<Result<crate::library_membership::LocalLibrary, String>> =
             None;
@@ -816,6 +820,22 @@ impl DirectPrepared {
                 })),
             );
         }
+        if wants_info(&options.diagnostic_level) {
+            push_log_event(
+                &mut log_events,
+                "info",
+                "lastfm_prepare_timing",
+                None,
+                None,
+                None,
+                None,
+                Some(serde_json::json!({
+                    "local_lookup_ms": local_lookup_ms, "online_fetch_ms": online_fetch_ms,
+                    "total_ms": prepare_started.elapsed().as_millis() as u64,
+                    "cached": cache_hits, "stale_offline": stale_offline, "missing": missing,
+                })),
+            );
+        }
         Ok((
             prepared,
             Diagnostics {
@@ -831,6 +851,11 @@ impl DirectPrepared {
                     "stale_offline": stale_offline,
                     "missing": missing,
                     "persistence_failed": persistence_failed,
+                    "durations_ms": {
+                        "local_lookup": local_lookup_ms,
+                        "online_fetch": online_fetch_ms,
+                        "total": prepare_started.elapsed().as_millis() as u64,
+                    },
                     "log_events_v1": log_events,
                 })),
             },

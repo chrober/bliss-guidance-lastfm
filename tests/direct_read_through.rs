@@ -65,6 +65,103 @@ fn candidate() -> Candidate {
 }
 
 #[test]
+fn offline_preferred_returns_before_slow_network_and_refreshes_after_host_closes() {
+    use bliss_playlist_guidance_spi::{GuidanceRequest, GuidanceResponse, SPI_VERSION};
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let limit = Instant::now() + Duration::from_secs(8);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 8192];
+                    let _ = stream.read(&mut request).unwrap();
+                    thread::sleep(Duration::from_millis(1500));
+                    let body = r#"{"similarartists":{"artist":[{"name":"Related Artist","mbid":"related-artist","match":"0.8"}]}}"#;
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nCache-Control: max-age=3600\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                    return true;
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < limit =>
+                {
+                    thread::sleep(Duration::from_millis(20))
+                }
+                _ => return false,
+            }
+        }
+    });
+    let store = store_path();
+    let mut seed = anchor();
+    seed.track.title = None;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .env(API_KEY_ENVIRONMENT, "test-key")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let request = GuidanceRequest::Prepare {
+        spi_version: SPI_VERSION,
+        job_id: "offline-fixture".into(),
+        options: serde_json::json!({"acquisition_mode":"direct", "api_endpoint":endpoint,
+            "store_path":store, "retrieval_policy":"offline_preferred",
+            "request_deadline_ms":3000, "max_concurrent_requests":1}),
+        artifacts: vec![],
+        resources: vec![],
+        anchors: vec![seed],
+    };
+    let start = Instant::now();
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "{}",
+        serde_json::to_string(&request).unwrap()
+    )
+    .unwrap();
+    let mut response = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut response)
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(matches!(
+        serde_json::from_str::<GuidanceResponse>(&response).unwrap(),
+        GuidanceResponse::Prepared { .. }
+    ));
+    drop(child.stdin.take());
+    child.wait().unwrap();
+    assert!(
+        elapsed < Duration::from_millis(1000),
+        "cached response waited {elapsed:?} for slow network"
+    );
+    assert!(
+        server.join().unwrap(),
+        "background refresh never contacted the server"
+    );
+    let until = Instant::now() + Duration::from_secs(4);
+    loop {
+        let graph = bliss_guidance_lastfm::store::GraphStore::open(&store).unwrap();
+        let id = graph
+            .find_artist(&bliss_guidance_lastfm::store::ArtistIdentity {
+                name: "Seed Artist".into(),
+                mbid: Some("seed-artist".into()),
+            })
+            .unwrap()
+            .unwrap();
+        if graph.artist_observation(id).unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "background refresh did not persist its result"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
 fn local_only_refreshes_library_before_persisting_artist_results() {
     let _guard = API_KEY_LOCK.lock().unwrap();
     std::env::set_var(API_KEY_ENVIRONMENT, "test-key");
@@ -182,6 +279,19 @@ fn offline_only_missing_data_is_neutral_and_makes_no_request() {
     .unwrap();
     assert_eq!(diagnostics.request_count, 0);
     assert_eq!(diagnostics.state.as_deref(), Some("missing"));
+    let timings = &diagnostics.details.as_ref().unwrap()["durations_ms"];
+    assert!(
+        timings["local_lookup"].is_u64(),
+        "local cache lookup timing is returned"
+    );
+    assert!(
+        timings["online_fetch"].is_u64(),
+        "online acquisition timing is returned"
+    );
+    assert!(
+        timings["total"].is_u64(),
+        "total preparation timing is returned"
+    );
     assert!(prepared
         .signals(
             &ScoreContext {
