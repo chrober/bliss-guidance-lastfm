@@ -198,3 +198,11 @@ trusted `diagnostic_level` prepare option. The provider emits bounded
 The native process never writes human log text to stderr or stdout. The owning
 Lyrion provider validates and renders these events in its own log category.
 API keys and signatures are excluded or redacted before an event is emitted.
+
+## Source snapshots
+
+The release workflow builds a source snapshot from its exact Git commit and
+vendors the locked Cargo dependencies. After unpacking, run
+`cargo build --locked --offline` from `source/` with the required Rust and platform build
+tools installed. `SOURCE_MANIFEST.json` lists dependency metadata and available
+notice files; it is not a legal review. Existing releases may predate this step.
