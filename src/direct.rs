@@ -974,7 +974,10 @@ fn stored_artists(
         .collect()
 }
 
-pub fn persist_pending_writes(options: &DirectOptions, pending: Value) -> Result<(), String> {
+pub fn persist_pending_writes(
+    options: &DirectOptions,
+    pending: Value,
+) -> Result<Vec<Value>, String> {
     let writes: Vec<(FetchTask, FetchResponse)> = serde_json::from_value(pending)
         .map_err(|error| format!("invalid pending Last.fm writes: {error}"))?;
     let now = unix_seconds() as i64;
@@ -992,6 +995,7 @@ pub fn persist_pending_writes(options: &DirectOptions, pending: Value) -> Result
     } else {
         None
     };
+    let mut reports = Vec::new();
     for (mut task, response) in writes {
         match &response {
             FetchResponse::Artist(_) => {
@@ -1026,6 +1030,36 @@ pub fn persist_pending_writes(options: &DirectOptions, pending: Value) -> Result
                         "Last.fm artist result exceeded the configured storage limit".into(),
                     );
                 }
+                if let (
+                    FetchTask::Artist {
+                        source_id, artist, ..
+                    },
+                    Some(library),
+                ) = (&task, &library)
+                {
+                    if let FetchResponse::Artist(value) = &response {
+                        if value.status == ResponseStatus::Modified {
+                            let excluded = value
+                                .results
+                                .iter()
+                                .filter(|target| {
+                                    library
+                                        .matching(&ArtistIdentity {
+                                            name: target.name.clone(),
+                                            mbid: target.mbid.clone(),
+                                        })
+                                        .is_none()
+                                })
+                                .count();
+                            let count = store
+                                .artist_observation(*source_id)?
+                                .ok_or("persisted Last.fm artist observation is missing")?
+                                .edges
+                                .len();
+                            reports.push(serde_json::json!({"artist":artist,"returned":value.results.len(),"stored":count,"excluded_non_library":excluded}));
+                        }
+                    }
+                }
             }
             FetchResponse::Track(value) => {
                 if let Some(path) = options.legacy_cache_path.as_deref() {
@@ -1047,7 +1081,7 @@ pub fn persist_pending_writes(options: &DirectOptions, pending: Value) -> Result
             }
         }
     }
-    Ok(())
+    Ok(reports)
 }
 
 fn persist_response(

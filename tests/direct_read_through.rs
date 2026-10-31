@@ -330,6 +330,53 @@ fn local_only_refreshes_library_before_persisting_artist_results() {
 }
 
 #[test]
+fn deferred_persistence_reports_library_filter_counts() {
+    let graph = store_path();
+    let library = graph.with_extension("library.sqlite");
+    let db = rusqlite::Connection::open(&library).unwrap();
+    db.execute_batch("CREATE TABLE contributors(id INTEGER PRIMARY KEY,name TEXT,musicbrainz_id TEXT); CREATE TABLE tracks(id INTEGER PRIMARY KEY,remote INTEGER); CREATE TABLE contributor_track(contributor INTEGER,track INTEGER); INSERT INTO tracks VALUES(1,0); INSERT INTO contributors VALUES(1,'Local','local-id'); INSERT INTO contributor_track VALUES(1,1);").unwrap();
+    let mut opts = options("http://127.0.0.1:9", &graph, "online_with_cache");
+    opts.storage_scope = bliss_guidance_lastfm::direct::StorageScope::LocalArtistsOnly;
+    opts.library_db_path = Some(library.to_string_lossy().into_owned());
+    let pending = serde_json::json!([[{"Artist":{"key":"seed", "source_id":0, "artist":"Seed", "artist_mbid":null, "existing":null}}, {"Artist":{"status":"Modified", "results":[{"name":"Local","mbid":"local-id","score":0.9},{"name":"External","mbid":"external-id","score":0.8}], "requested_limit":25, "actual_result_count":2, "headers":{"cache_control":null,"expires":null,"etag":null,"last_modified":null}}}]]);
+    let reports =
+        bliss_guidance_lastfm::direct::persist_pending_writes(&opts, pending.clone()).unwrap();
+    assert_eq!(
+        reports,
+        vec![serde_json::json!({"artist":"Seed","returned":2,"stored":1,"excluded_non_library":1})]
+    );
+    use std::process::{Command, Stdio};
+    let dir = store_path().with_extension("report-dir");
+    std::fs::create_dir(&dir).unwrap();
+    let worker_graph = dir.join("graph.sqlite");
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .arg("persist-guidance-background")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let payload = serde_json::json!({"options":{"acquisition_mode":"direct","store_path":worker_graph,"storage_scope":"local_artists_only","library_db_path":library,"request_deadline_ms":1000,"max_concurrent_requests":1},"writes":pending});
+    worker
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&payload).unwrap().as_bytes())
+        .unwrap();
+    assert!(worker.wait().unwrap().success());
+    let files: Vec<_> = std::fs::read_dir(dir.join("persistence-errors"))
+        .unwrap()
+        .collect();
+    assert_eq!(files.len(), 1);
+    let file = files[0].as_ref().unwrap().path();
+    assert!(file
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .starts_with("info-"));
+    let event: serde_json::Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(event, reports[0]);
+}
+
+#[test]
 fn online_fill_is_reused_by_a_new_offline_only_session() {
     let _guard = API_KEY_LOCK.lock().unwrap();
     std::env::set_var(API_KEY_ENVIRONMENT, "test-key");

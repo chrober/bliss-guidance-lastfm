@@ -477,7 +477,7 @@ fn run_background_persistence() -> Result<(), String> {
     let payload: serde_json::Value = serde_json::from_reader(io::stdin().lock())
         .map_err(|error| format!("invalid background refresh input: {error}"))?;
     let options = direct::DirectOptions::from_prepare_options(&payload["options"])?;
-    let result = (|| {
+    let result: Result<(), String> = (|| {
         let lock_path =
             std::path::Path::new(&options.store_path).with_extension("guidance-refresh.lock");
         let lock = std::fs::OpenOptions::new()
@@ -490,7 +490,11 @@ fn run_background_persistence() -> Result<(), String> {
         // Wait only in the detached, low-priority worker. Dropping a concurrent
         // refresh would silently lose a different job's missing artist lookups.
         lock.lock_exclusive().map_err(|error| error.to_string())?;
-        direct::persist_pending_writes(&options, payload["writes"].clone())
+        let reports = direct::persist_pending_writes(&options, payload["writes"].clone())?;
+        for (index, report) in reports.iter().enumerate() {
+            report_persistence_event(&options.store_path, "info", index, report)?;
+        }
+        Ok(())
     })();
     if let Err(error) = &result {
         let _ = report_persistence_error(&options.store_path, error);
@@ -499,6 +503,21 @@ fn run_background_persistence() -> Result<(), String> {
 }
 
 fn report_persistence_error(store_path: &str, error: &str) -> Result<(), String> {
+    let safe_error: String = error.chars().take(512).collect();
+    report_persistence_event(
+        store_path,
+        "error",
+        0,
+        &serde_json::json!({"error": safe_error}),
+    )
+}
+
+fn report_persistence_event(
+    store_path: &str,
+    level: &str,
+    index: usize,
+    event: &serde_json::Value,
+) -> Result<(), String> {
     let parent = std::path::Path::new(store_path)
         .parent()
         .ok_or("missing graph directory")?;
@@ -508,14 +527,12 @@ fn report_persistence_error(store_path: &str, error: &str) -> Result<(), String>
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| error.to_string())?
         .as_nanos();
-    let stem = format!("error-{}-{stamp}", std::process::id());
+    let stem = format!("{level}-{}-{}", std::process::id(), stamp + index as u128);
     let temporary = dir.join(format!("{stem}.tmp"));
     let final_path = dir.join(format!("{stem}.json"));
-    let safe_error: String = error.chars().take(512).collect();
     std::fs::write(
         &temporary,
-        serde_json::to_vec(&serde_json::json!({"error": safe_error}))
-            .map_err(|error| error.to_string())?,
+        serde_json::to_vec(event).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
     std::fs::rename(temporary, final_path).map_err(|error| error.to_string())
