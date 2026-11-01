@@ -11,6 +11,13 @@ def build(source, output):
     if output.exists():
         raise FileExistsError(f'refusing to overwrite {output}')
     with tarfile.open(source, 'r:gz') as archive:
+        inventory = archive.getmember('source/SOURCE_MANIFEST.json')
+        if not inventory.isfile():
+            raise ValueError('dependency inventory must be a regular file')
+        manifest = json.load(archive.extractfile(inventory))
+        if manifest.get('schema_version') != 1 or not isinstance(manifest.get('packages'), list):
+            raise ValueError('invalid dependency inventory')
+        declared = {name for package in manifest['packages'] for name in package.get('notice_files', [])}
         selected = {}
         for member in archive:
             path = PurePosixPath(member.name)
@@ -23,18 +30,19 @@ def build(source, output):
             is_vendor_notice = (relative.parts[0] == 'vendor' and
                                 path.name.upper().startswith(('LICENSE', 'COPYING', 'NOTICE', 'COPYRIGHT', 'AUTHORS')))
             is_supplement = relative.parts[0] == 'third-party-licenses'
-            if (is_manifest or is_vendor_notice or is_supplement) and (member.issym() or member.islnk()):
+            is_declared = relative.as_posix() in declared
+            if (is_manifest or is_vendor_notice or is_supplement or is_declared) and (member.issym() or member.islnk()):
                 raise ValueError(f'linked license or inventory member requires review: {member.name}')
             if not member.isfile():
                 continue
-            if is_manifest or is_vendor_notice or is_supplement:
+            if is_manifest or is_vendor_notice or is_supplement or is_declared:
                 key = relative.as_posix()
                 if key in selected:
                     raise ValueError(f'duplicate archive member: {key}')
                 selected[key] = archive.extractfile(member).read()
-        manifest = json.loads(selected['SOURCE_MANIFEST.json'])
-        if manifest.get('schema_version') != 1 or not isinstance(manifest.get('packages'), list):
-            raise ValueError('invalid dependency inventory')
+        missing = declared - selected.keys()
+        if missing:
+            raise ValueError(f'declared notice missing from source archive: {sorted(missing)}')
     output.parent.mkdir(parents=True, exist_ok=True)
     created = False
     try:

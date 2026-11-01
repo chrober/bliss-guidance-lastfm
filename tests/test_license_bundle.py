@@ -52,6 +52,20 @@ class LicenseBundleTests(unittest.TestCase):
                 self.assertNotEqual(subprocess.run([sys.executable, str(SCRIPT), str(source), str(output)], capture_output=True).returncode, 0)
                 self.assertFalse(output.exists())
 
+    def test_includes_manifest_declared_license_with_nonstandard_name(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / 'source.tar.gz', root / 'notices.zip'
+            declared = 'vendor/example-1/legal/terms.txt'
+            manifest = {'schema_version': 1, 'packages': [{'notice_files': [declared]}]}
+            with tarfile.open(source, 'w:gz') as tar:
+                add_file(tar, 'source/SOURCE_MANIFEST.json', json.dumps(manifest).encode())
+                add_file(tar, 'source/' + declared, b'license terms')
+            run = subprocess.run([sys.executable, str(SCRIPT), str(source), str(output)], capture_output=True, text=True)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            with zipfile.ZipFile(output) as bundle:
+                self.assertEqual(bundle.read(declared), b'license terms')
+
     def test_rejects_symlinked_notice_instead_of_silently_omitting_it(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
