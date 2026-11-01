@@ -29,6 +29,7 @@ class SourceArchiveTests(unittest.TestCase):
                 run('git', 'config', 'user.email', 'fixture@example.invalid', cwd=directory)
             (dep / 'Cargo.toml').write_text('[package]\nname="fixture-dep"\nversion="0.1.0"\nedition="2021"\nlicense-file="LICENSE"\n')
             (dep / 'LICENSE').write_text('Fixture license notice.\n')
+            (dep / 'AUTHORS').write_text('Additional copyright and license material.\n')
             (dep / 'src/lib.rs').write_text('pub fn value() -> u32 { 42 }\n')
             run('git', 'add', '.', cwd=dep)
             run('git', 'commit', '-qm', 'dependency', cwd=dep)
@@ -53,6 +54,7 @@ class SourceArchiveTests(unittest.TestCase):
             self.assertIn('fixture-dep-0.1.0', dependency['manifest_path'])
             self.assertEqual((source / dependency['license_file']).read_text(), 'Fixture license notice.\n')
             self.assertIn(dependency['license_file'], dependency['notice_files'])
+            self.assertIn('vendor/fixture-dep-0.1.0/AUTHORS', dependency['notice_files'])
             env = dict(os.environ, CARGO_HOME=str(root / 'empty-cargo-home'))
             run('cargo', 'check', '--locked', '--offline', cwd=source, env=env)
 

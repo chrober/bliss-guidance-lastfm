@@ -59,7 +59,7 @@ def create_archive(repo: Path, revision: str, output: Path) -> None:
         def notice_files(package):
             root = Path(package['manifest_path']).parent
             files = {source_path(path) for path in root.iterdir()
-                     if path.is_file() and path.name.upper().startswith(('LICENSE', 'COPYING', 'NOTICE'))}
+                     if path.is_file() and path.name.upper().startswith(('LICENSE', 'COPYING', 'NOTICE', 'COPYRIGHT', 'AUTHORS'))}
             if package['license_file'] is not None:
                 declared = source_path(package['license_file'], package['manifest_path'])
                 if not (source / declared).is_file():
