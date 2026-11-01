@@ -27,6 +27,7 @@ class LicenseBundleTests(unittest.TestCase):
                 add_file(tar, 'source/SOURCE_MANIFEST.json', json.dumps({'schema_version': 1, 'source_commit': 'a' * 40, 'packages': []}).encode())
                 add_file(tar, 'source/vendor/example-1/LICENSE-MIT', b'license text')
                 add_file(tar, 'source/vendor/example-1/nested/NOTICE', b'notice text')
+                add_file(tar, 'source/vendor/example-1/AUTHORS', b'copyright and license')
                 add_file(tar, 'source/vendor/example-1/src/lib.rs', b'not a notice')
                 add_file(tar, 'source/third-party-licenses/missing-LICENSE', b'supplement')
             run = subprocess.run([sys.executable, str(SCRIPT), str(source), str(output)], capture_output=True, text=True)
@@ -34,6 +35,7 @@ class LicenseBundleTests(unittest.TestCase):
             with zipfile.ZipFile(output) as bundle:
                 self.assertEqual(bundle.read('vendor/example-1/LICENSE-MIT'), b'license text')
                 self.assertEqual(bundle.read('vendor/example-1/nested/NOTICE'), b'notice text')
+                self.assertEqual(bundle.read('vendor/example-1/AUTHORS'), b'copyright and license')
                 self.assertEqual(bundle.read('third-party-licenses/missing-LICENSE'), b'supplement')
                 self.assertIn('SOURCE_MANIFEST.json', bundle.namelist())
                 self.assertNotIn('vendor/example-1/src/lib.rs', bundle.namelist())
@@ -49,6 +51,19 @@ class LicenseBundleTests(unittest.TestCase):
                     add_file(tar, unsafe, b'bad')
                 self.assertNotEqual(subprocess.run([sys.executable, str(SCRIPT), str(source), str(output)], capture_output=True).returncode, 0)
                 self.assertFalse(output.exists())
+
+    def test_rejects_symlinked_notice_instead_of_silently_omitting_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / 'source.tar.gz', root / 'notices.zip'
+            with tarfile.open(source, 'w:gz') as tar:
+                add_file(tar, 'source/SOURCE_MANIFEST.json', b'{"schema_version":1,"packages":[]}')
+                link = tarfile.TarInfo('source/vendor/example/LICENSE')
+                link.type = tarfile.SYMTYPE
+                link.linkname = 'elsewhere'
+                tar.addfile(link)
+            self.assertNotEqual(subprocess.run([sys.executable, str(SCRIPT), str(source), str(output)], capture_output=True).returncode, 0)
+            self.assertFalse(output.exists())
 
 
 if __name__ == '__main__':

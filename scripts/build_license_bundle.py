@@ -16,13 +16,17 @@ def build(source, output):
             path = PurePosixPath(member.name)
             if path.is_absolute() or '..' in path.parts or '\\' in member.name or ':' in member.name:
                 raise ValueError(f'unsafe archive path: {member.name}')
-            if not member.isfile() or len(path.parts) < 2 or path.parts[0] != 'source':
+            if len(path.parts) < 2 or path.parts[0] != 'source':
                 continue
             relative = PurePosixPath(*path.parts[1:])
             is_manifest = str(relative) == 'SOURCE_MANIFEST.json'
             is_vendor_notice = (relative.parts[0] == 'vendor' and
-                                path.name.upper().startswith(('LICENSE', 'COPYING', 'NOTICE', 'COPYRIGHT')))
+                                path.name.upper().startswith(('LICENSE', 'COPYING', 'NOTICE', 'COPYRIGHT', 'AUTHORS')))
             is_supplement = relative.parts[0] == 'third-party-licenses'
+            if (is_manifest or is_vendor_notice or is_supplement) and (member.issym() or member.islnk()):
+                raise ValueError(f'linked license or inventory member requires review: {member.name}')
+            if not member.isfile():
+                continue
             if is_manifest or is_vendor_notice or is_supplement:
                 key = relative.as_posix()
                 if key in selected:
