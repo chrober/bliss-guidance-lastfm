@@ -256,6 +256,15 @@ fn failed_background_persistence_leaves_a_report_for_lyrion() {
     use std::process::{Command, Stdio};
     let directory = store_path().with_extension("fixture-dir");
     std::fs::create_dir(&directory).unwrap();
+    let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    listener
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    std::fs::write(
+        directory.join("persistence-notify-port"),
+        listener.local_addr().unwrap().port().to_string(),
+    )
+    .unwrap();
     let graph = directory.join("graph.sqlite");
     std::fs::create_dir(&graph).unwrap();
     let mut worker = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
@@ -272,6 +281,11 @@ fn failed_background_persistence_leaves_a_report_for_lyrion() {
         .write_all(serde_json::to_string(&payload).unwrap().as_bytes())
         .unwrap();
     assert!(!worker.wait().unwrap().success());
+    let mut wake = [0u8; 16];
+    let (length, _) = listener
+        .recv_from(&mut wake)
+        .expect("detached worker wakes Lyrion");
+    assert_eq!(&wake[..length], b"wake");
     let entries: Vec<_> = std::fs::read_dir(directory.join("persistence-errors"))
         .unwrap()
         .collect();

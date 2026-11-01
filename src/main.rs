@@ -535,7 +535,22 @@ fn report_persistence_event(
         serde_json::to_vec(event).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    std::fs::rename(temporary, final_path).map_err(|error| error.to_string())
+    std::fs::rename(temporary, final_path).map_err(|error| error.to_string())?;
+    // Notification is only a wake-up hint; the report remains durable if LMS
+    // is offline or the listener is unavailable.
+    let endpoint = parent.join("persistence-notify-port");
+    if std::fs::metadata(&endpoint).is_ok_and(|m| m.is_file() && m.len() <= 8) {
+        if let Ok(port) = std::fs::read_to_string(endpoint) {
+            if let Ok(port) = port.trim().parse::<u16>() {
+                if port != 0 {
+                    if let Ok(socket) = std::net::UdpSocket::bind("127.0.0.1:0") {
+                        let _ = socket.send_to(b"wake", (std::net::Ipv4Addr::LOCALHOST, port));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn diagnostic_level(options: &serde_json::Value) -> &str {
@@ -778,6 +793,68 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     static FIXTURE_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn persistence_report_notifies_local_listener_after_writing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "lastfm-notify-{}-{}",
+            std::process::id(),
+            FIXTURE_SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        listener
+            .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        std::fs::write(
+            dir.join("persistence-notify-port"),
+            listener.local_addr().unwrap().port().to_string(),
+        )
+        .unwrap();
+        report_persistence_event(
+            dir.join("graph.sqlite").to_str().unwrap(),
+            "info",
+            0,
+            &serde_json::json!({"artist":"Faun"}),
+        )
+        .unwrap();
+        let mut buffer = [0u8; 16];
+        assert!(
+            listener.recv_from(&mut buffer).is_ok(),
+            "worker must wake the plugin after the report exists"
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.join("persistence-errors"))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persistence_report_remains_available_without_listener() {
+        let dir = std::env::temp_dir().join(format!(
+            "lastfm-notify-offline-{}-{}",
+            std::process::id(),
+            FIXTURE_SERIAL.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        report_persistence_event(
+            dir.join("graph.sqlite").to_str().unwrap(),
+            "error",
+            0,
+            &serde_json::json!({"error":"locked"}),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_dir(dir.join("persistence-errors"))
+                .unwrap()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn version_metadata_identifies_lastfm_provider_and_spi() {
