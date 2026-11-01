@@ -37,6 +37,7 @@ jobs:
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
       - run: python tests/test_source_archive.py
+      - run: python tests/test_license_bundle.py
 
   build:
     name: Build ${{ matrix.asset }}
@@ -128,7 +129,9 @@ jobs:
           set -euo pipefail
           mkdir -p source-assets
           python scripts/build_source_archive.py --repo . --commit "$GITHUB_SHA" --output source-assets/bliss-guidance-lastfm-source.tar.gz
+          python scripts/build_license_bundle.py source-assets/bliss-guidance-lastfm-source.tar.gz source-assets/bliss-guidance-lastfm-third-party-licenses.zip
           (cd source-assets && sha256sum bliss-guidance-lastfm-source.tar.gz > bliss-guidance-lastfm-source.tar.gz.sha256)
+          (cd source-assets && sha256sum bliss-guidance-lastfm-third-party-licenses.zip > bliss-guidance-lastfm-third-party-licenses.zip.sha256)
       - uses: actions/upload-artifact@v4
         with:
           name: bliss-guidance-lastfm-source

@@ -206,3 +206,4 @@ vendors the locked Cargo dependencies. After unpacking, run
 `cargo build --locked --offline` from `source/` with the required Rust and platform build
 tools installed. `SOURCE_MANIFEST.json` lists dependency metadata and available
 notice files; it is not a legal review. Existing releases may predate this step.
+The release also includes a checksummed ZIP of collected dependency license and notice material.
