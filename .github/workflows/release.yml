@@ -171,6 +171,7 @@ jobs:
         run: |
           set -euo pipefail
           printf '# bliss-guidance-lastfm %s\n\nNative Last.fm guidance-provider binaries for compatible Bliss guidance hosts.\n\nBuilt from commit %s after fmt, clippy, and test gates.\n' "$VERSION" "$GITHUB_SHA" > release-notes.md
+          printf '\n[Source archive](https://github.com/%s/releases/download/%s/bliss-guidance-lastfm-source.tar.gz) (see `SOURCE_ARCHIVE_README.txt` inside) · [Third-party licenses](https://github.com/%s/releases/download/%s/bliss-guidance-lastfm-third-party-licenses.zip). SHA-256 files are available with the assets.\n' "$GITHUB_REPOSITORY" "$TAG" "$GITHUB_REPOSITORY" "$TAG" >> release-notes.md
           prerelease_flag=()
           if [ "$PRERELEASE" = true ]; then prerelease_flag=(--prerelease); fi
           remote_tag="$(git ls-remote --tags origin "refs/tags/$TAG")"
@@ -179,7 +180,7 @@ jobs:
             test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$GITHUB_SHA" || { echo 'Release tag points to a different source commit' >&2; exit 1; }
           fi
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release-assets/* --clobber
+            echo "Release already exists: $TAG; refusing to overwrite assets" >&2; exit 1
           else
             gh release create "$TAG" release-assets/* --target "$GITHUB_SHA" --title "bliss-guidance-lastfm $VERSION" --notes-file release-notes.md "${prerelease_flag[@]}"
           fi
