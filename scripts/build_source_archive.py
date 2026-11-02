@@ -78,8 +78,10 @@ def create_archive(repo: Path, revision: str, output: Path) -> None:
         (source / 'SOURCE_ARCHIVE_README.txt').write_text(
             'This archive captures a Git commit and Cargo dependencies. The vendor directory\n'
             'contains crate source and included notices. See SOURCE_MANIFEST.json and the\n'
-            'project workflows for build details. Try cargo build --locked --offline after\n'
-            'installing the required Rust toolchain and platform-specific build tools.\n'
+            'project workflows for build details. After extraction, run cd source and then\n'
+            'cargo build --locked --offline with the required Rust toolchain and platform-\n'
+            'specific build tools installed. Cargo discovers .cargo/config.toml from the\n'
+            'working directory; --manifest-path alone does not select this configuration.\n'
             'Binary-to-source provenance and third-party rights require separate verification.\n',
             encoding='utf-8')
         created = False

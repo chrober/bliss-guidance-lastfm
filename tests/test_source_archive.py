@@ -46,6 +46,7 @@ class SourceArchiveTests(unittest.TestCase):
             with tarfile.open(archive, 'r:gz') as tar:
                 tar.extractall(extracted, filter='data')
             source = extracted / 'source'
+            self.assertIn('cd source', (source / 'SOURCE_ARCHIVE_README.txt').read_text(encoding='utf-8'))
             self.assertIn('fixture_dep::value()', (source / 'src/main.rs').read_text())
             self.assertTrue((source / 'vendor/fixture-dep-0.1.0/src/lib.rs').is_file())
             manifest = json.loads((source / 'SOURCE_MANIFEST.json').read_text())
