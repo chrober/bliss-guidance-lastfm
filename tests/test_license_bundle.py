@@ -1,4 +1,5 @@
 import io
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -19,6 +20,12 @@ def add_file(tar, name, data):
 
 
 class LicenseBundleTests(unittest.TestCase):
+    def test_fiat_authors_supplement_matches_upstream(self):
+        path = SCRIPT.parents[1] / 'third-party-licenses/fiat-crypto-AUTHORS'
+        self.assertTrue(path.is_file(), 'fiat-crypto authors notice is missing')
+        content = path.read_text(encoding='utf-8').replace('\r\n', '\n').removesuffix('\n').encode('utf-8')
+        self.assertEqual(hashlib.sha256(content).hexdigest(), 'ad74c036a6afaedc418fed65f171c877c2f74a4c70938a03930aa11c98a20508')
+
     def test_copies_inventory_vendor_notices_and_supplements(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

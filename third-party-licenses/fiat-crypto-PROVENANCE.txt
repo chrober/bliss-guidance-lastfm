@@ -1,0 +1,8 @@
+The fiat-crypto AUTHORS file accompanies ring 0.17.14's bundled Fiat code.
+It is byte-identical in these two sources:
+https://github.com/briansmith/ring/blob/2723abbca9e83347d82b056d5b239c6604f786df/third_party/fiat/AUTHORS
+https://github.com/mit-plv/fiat-crypto/blob/6ccc6638716d4632304baf1adbb5c47c3a12ea6f/AUTHORS
+The ring commit is recorded by the published crate, marked dirty. Its Fiat
+LICENSE matches that commit. The crate itself omits the AUTHORS file.
+Upstream SHA-256 (no trailing newline): ad74c036a6afaedc418fed65f171c877c2f74a4c70938a03930aa11c98a20508
+The copy adds a final newline and may use platform-specific line endings.
