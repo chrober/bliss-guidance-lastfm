@@ -502,6 +502,27 @@ fn run_background_persistence() -> Result<(), String> {
     result
 }
 
+fn run_queued_drain(path: &std::path::Path) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| format!("cannot read deferred Last.fm drain request: {e}"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("invalid deferred Last.fm drain request: {e}"))?;
+    let options = direct::DirectOptions::from_prepare_options(&value)?;
+    let result = direct::drain_queued_artists(&options);
+    match result {
+        Ok(reports) => {
+            for (index, report) in reports.iter().enumerate() {
+                report_persistence_event(&options.store_path, "info", index, report)?;
+            }
+            Ok(())
+        }
+        Err(error) => {
+            let _ = report_persistence_error(&options.store_path, &error);
+            Err(error)
+        }
+    }
+}
+
 fn report_persistence_error(store_path: &str, error: &str) -> Result<(), String> {
     let safe_error: String = error.chars().take(512).collect();
     report_persistence_event(
@@ -677,6 +698,16 @@ fn main() {
                 libc::setpriority(libc::PRIO_PROCESS, 0, 10);
             }
             if run_background_persistence().is_err() {
+                std::process::exit(1);
+            }
+            return;
+        }
+        [command, request_path] if command == "drain-guidance-background" => {
+            #[cfg(unix)]
+            unsafe {
+                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+            }
+            if run_queued_drain(std::path::Path::new(request_path)).is_err() {
                 std::process::exit(1);
             }
             return;

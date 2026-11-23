@@ -48,8 +48,12 @@ the API key through the child process environment only.
 During artifact-mode `prepare`, the add-on reads the artifact once and builds
 an index of `source entity -> local candidate ID -> channel -> strongest
 support`. During direct-mode `prepare`, it resolves the requested anchor
-relations from the SQLite graph or bounded HTTP requests, transactionally
-persists complete responses, and builds the same in-memory shape. It also
+relations from the SQLite graph or bounded HTTP requests and builds the same
+in-memory shape. Newly fetched results are persisted asynchronously after the
+guidance response. If local-only artist membership is unavailable during a
+library scan, artist observations are queued for a later provider-triggered
+drain; queued data counts towards the retained-data limit. Track similarities
+remain in the separate track cache, not the SQLite artist graph. It also
 uses the supplied local anchors to build `track anchor ID -> Last.fm artist
 source ID(s)`: it joins an anchor's artist MBID to an artist edge's MBID first,
 then uses a normalized artist-name fallback only when no MBID relation exists.

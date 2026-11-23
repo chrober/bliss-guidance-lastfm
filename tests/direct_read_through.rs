@@ -252,6 +252,62 @@ fn locked_database_does_not_delay_online_guidance_response() {
 }
 
 #[test]
+fn mixed_pending_writes_cache_tracks_even_when_artist_membership_is_unavailable() {
+    let graph = store_path();
+    let mut opts = options("http://127.0.0.1:9", &graph, "online_with_cache");
+    opts.storage_scope = bliss_guidance_lastfm::direct::StorageScope::LocalArtistsOnly;
+    let writes = serde_json::json!([
+        [{"Artist":{"key":"artist:fixture","source_id":0,"artist":"Seed","artist_mbid":null,"existing":null}}, {"Artist":{"status":"Modified","results":[],"requested_limit":25,"actual_result_count":0,"headers":{"cache_control":null,"expires":null,"etag":null,"last_modified":null}}}],
+        [{"Track":{"key":"track:fixture","artist":"Seed","title":"Song","recording_mbid":null}}, {"Track":{"status":"Modified","results":[{"artist":"Related","title":"Track","artist_mbid":null,"recording_mbid":null,"score":0.8}],"requested_limit":25,"actual_result_count":1,"headers":{"cache_control":null,"expires":null,"etag":null,"last_modified":null}}}]
+    ]);
+    let _ = bliss_guidance_lastfm::direct::persist_pending_writes(&opts, writes);
+    let cache = std::fs::read_to_string(opts.legacy_cache_path.unwrap()).unwrap();
+    assert!(cache.contains("Related"));
+}
+
+#[test]
+fn track_cache_does_not_require_library_membership_during_scan() {
+    let graph = store_path();
+    let mut opts = options("http://127.0.0.1:9", &graph, "online_with_cache");
+    opts.storage_scope = bliss_guidance_lastfm::direct::StorageScope::LocalArtistsOnly;
+    let writes = serde_json::json!([[{"Track":{"key":"track:fixture","artist":"Seed","title":"Song","recording_mbid":null}}, {"Track":{"status":"Modified","results":[{"artist":"Related","title":"Track","artist_mbid":null,"recording_mbid":null,"score":0.8}],"requested_limit":25,"actual_result_count":1,"headers":{"cache_control":null,"expires":null,"etag":null,"last_modified":null}}}]]);
+    bliss_guidance_lastfm::direct::persist_pending_writes(&opts, writes).unwrap();
+    let cache = std::fs::read_to_string(opts.legacy_cache_path.unwrap()).unwrap();
+    assert!(cache.contains("Related"));
+}
+
+#[test]
+fn scan_time_artist_results_are_queued_when_library_membership_is_unavailable() {
+    use std::process::{Command, Stdio};
+    let dir = store_path().with_extension("pending-fixture");
+    std::fs::create_dir(&dir).unwrap();
+    let graph = dir.join("graph.sqlite");
+    let pending = serde_json::json!([[{"Artist":{"key":"seed", "source_id":0, "artist":"Seed", "artist_mbid":null, "existing":null}}, {"Artist":{"status":"Modified", "results":[{"name":"Local","mbid":"local-id","score":0.9}], "requested_limit":25, "actual_result_count":1, "headers":{"cache_control":null,"expires":null,"etag":null,"last_modified":null}}}]]);
+    let payload = serde_json::json!({"options":{"acquisition_mode":"direct","store_path":graph,"storage_scope":"local_artists_only","request_deadline_ms":1000,"max_concurrent_requests":1},"writes":pending});
+    let mut worker = Command::new(env!("CARGO_BIN_EXE_bliss-guidance-lastfm"))
+        .arg("persist-guidance-background")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    worker
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(serde_json::to_string(&payload).unwrap().as_bytes())
+        .unwrap();
+    assert!(
+        worker.wait().unwrap().success(),
+        "unavailable membership should defer rather than lose fetched results"
+    );
+    assert!(std::fs::read_dir(
+        bliss_guidance_lastfm::deferred_queue::queue_directory(&graph).unwrap()
+    )
+    .unwrap()
+    .next()
+    .is_some());
+}
+
+#[test]
 fn failed_background_persistence_leaves_a_report_for_lyrion() {
     use std::process::{Command, Stdio};
     let directory = store_path().with_extension("fixture-dir");

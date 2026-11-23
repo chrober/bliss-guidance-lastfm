@@ -289,6 +289,10 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                     }
                 }
             };
+            let _budget =
+                crate::storage_budget::BudgetLock::acquire(Path::new(&request.store_path))?;
+            let pending_bytes =
+                crate::deferred_queue::queued_bytes(Path::new(&request.store_path))?;
             let persisted = persist_artist_response(
                 &mut store,
                 &identity,
@@ -298,8 +302,10 @@ fn sync(request: &GraphRequest, output: &mut impl Write) -> Result<(), String> {
                 request
                     .budget_bytes
                     .unwrap_or(DEFAULT_BUDGET_BYTES)
-                    .saturating_sub(cache_usage.bytes(unix_seconds())?),
+                    .saturating_sub(cache_usage.bytes(unix_seconds())?)
+                    .saturating_sub(pending_bytes),
             )?;
+            drop(_budget);
             match persisted {
                 Some(true) => progress.changed += 1,
                 Some(false) => {}
@@ -404,6 +410,9 @@ fn delete(request: &GraphRequest, output: &mut impl Write) -> Result<(), String>
     if request.confirmed != Some(true) {
         return Err("Last.fm graph deletion requires explicit confirmation".to_owned());
     }
+    let graph = Path::new(&request.store_path);
+    let _budget = crate::storage_budget::BudgetLock::acquire(graph)?;
+    crate::deferred_queue::clear_locked(graph)?;
     for path in database_paths(&request.store_path) {
         if path.exists() {
             std::fs::remove_file(&path)
@@ -447,9 +456,19 @@ fn retained_storage_bytes(
     store: &GraphStore,
     cache_usage: &mut crate::legacy_cache::CacheUsage,
 ) -> Result<u64, String> {
-    store
-        .retained_lastfm_bytes()
-        .and_then(|bytes| Ok(bytes.saturating_add(cache_usage.bytes(unix_seconds())?)))
+    let _budget = match store.database_path() {
+        Some(path) => Some(crate::storage_budget::BudgetLock::acquire(Path::new(path))?),
+        None => None,
+    };
+    let queued = match store.database_path() {
+        Some(path) => crate::deferred_queue::queued_bytes(Path::new(path))?,
+        None => 0,
+    };
+    store.retained_lastfm_bytes().and_then(|bytes| {
+        Ok(bytes
+            .saturating_add(cache_usage.bytes(unix_seconds())?)
+            .saturating_add(queued))
+    })
 }
 
 fn unix_seconds() -> i64 {

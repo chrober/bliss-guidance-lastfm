@@ -527,6 +527,38 @@ fn mutating_commands_require_api_key_mode_and_environment_except_confirmed_delet
 }
 
 #[test]
+fn confirmed_delete_also_removes_deferred_artist_data() {
+    let store = temp_path("delete-pending", "sqlite");
+    let artist = serde_json::json!([{"Artist":{"key":"a","artist":"Seed","artist_mbid":null,"source_id":0,"existing":null}}, {"Artist":{"status":"Modified","results":[{"name":"Other","mbid":null,"score":0.8}],"requested_limit":25,"actual_result_count":1,"headers":{"cache_control":null,"expires":null,"etag":null,"last_modified":null}}}]);
+    assert!(bliss_guidance_lastfm::deferred_queue::enqueue_artist(
+        &store, None, &artist, 10000, 100
+    )
+    .unwrap());
+    let request_path = request(&store, serde_json::json!({"confirmed":true}));
+    assert!(run("delete", &request_path).status.success());
+    assert_eq!(
+        bliss_guidance_lastfm::deferred_queue::queued_bytes(&store).unwrap(),
+        0
+    );
+}
+
+#[test]
+fn graph_status_includes_pending_artist_data_in_retained_usage() {
+    let store = temp_path("pending-status", "sqlite");
+    let artist = serde_json::json!([{"Artist":{"key":"a","artist":"Seed","artist_mbid":null,"source_id":0,"existing":null}}, {"Artist":{"status":"Modified","results":[{"name":"Other","mbid":null,"score":0.8}],"requested_limit":25,"actual_result_count":1,"headers":{"cache_control":null,"expires":null,"etag":null,"last_modified":null}}}]);
+    assert!(bliss_guidance_lastfm::deferred_queue::enqueue_artist(
+        &store, None, &artist, 10000, 100
+    )
+    .unwrap());
+    let expected = bliss_guidance_lastfm::deferred_queue::queued_bytes(&store).unwrap();
+    let request_path = request(&store, serde_json::json!({}));
+    let output = run("status", &request_path);
+    assert!(output.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["retained_lastfm_bytes"], expected);
+}
+
+#[test]
 fn sync_emits_versioned_progress_and_strictly_respects_the_budget() {
     use std::io::{Read, Write};
     use std::net::TcpListener;

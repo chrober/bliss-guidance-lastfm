@@ -154,6 +154,10 @@ struct RetainedArtistResult {
 }
 
 impl GraphStore {
+    pub fn database_path(&self) -> Option<&str> {
+        self.connection.path()
+    }
+
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
         Self::open_at(path, unix_seconds())
     }

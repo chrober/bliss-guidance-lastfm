@@ -678,6 +678,12 @@ impl DirectPrepared {
                 if !may_persist {
                     persistence_failed += 1;
                 } else {
+                    let _budget = crate::storage_budget::BudgetLock::acquire(
+                        std::path::Path::new(&options.store_path),
+                    )?;
+                    let queued = crate::deferred_queue::queued_bytes(std::path::Path::new(
+                        &options.store_path,
+                    ))?;
                     match persist_response(
                         &mut store,
                         &task,
@@ -690,7 +696,8 @@ impl DirectPrepared {
                         Some(
                             options
                                 .budget_bytes
-                                .saturating_sub(cache_usage.bytes(unix_seconds() as i64)?),
+                                .saturating_sub(cache_usage.bytes(unix_seconds() as i64)?)
+                                .saturating_sub(queued),
                         ),
                     ) {
                         Err(_) => persistence_failed += 1,
@@ -718,13 +725,22 @@ impl DirectPrepared {
                         .as_deref()
                         .filter(|_| !defer_writes)
                     {
+                        let _budget = crate::storage_budget::BudgetLock::acquire(
+                            std::path::Path::new(&options.store_path),
+                        )?;
+                        let queued = crate::deferred_queue::queued_bytes(std::path::Path::new(
+                            &options.store_path,
+                        ))?;
                         let graph_bytes = store.retained_lastfm_bytes()?;
                         match crate::legacy_cache::cache_tracks_with_budget(
                             path,
                             &key,
                             now,
                             &value.results,
-                            options.budget_bytes.saturating_sub(graph_bytes),
+                            options
+                                .budget_bytes
+                                .saturating_sub(graph_bytes)
+                                .saturating_sub(queued),
                         ) {
                             Err(_) => persistence_failed += 1,
                             Ok(false) if wants_info(&options.diagnostic_level) => push_log_event(
@@ -978,27 +994,86 @@ pub fn persist_pending_writes(
     options: &DirectOptions,
     pending: Value,
 ) -> Result<Vec<Value>, String> {
-    let writes: Vec<(FetchTask, FetchResponse)> = serde_json::from_value(pending)
+    persist_pending_writes_inner(options, pending, false, 0, None)
+}
+
+fn persist_pending_writes_inner(
+    options: &DirectOptions,
+    pending: Value,
+    budget_already_locked: bool,
+    transferring_bytes: u64,
+    shared_library: Option<&crate::library_membership::LocalLibrary>,
+) -> Result<Vec<Value>, String> {
+    let mut writes: Vec<(FetchTask, FetchResponse)> = serde_json::from_value(pending)
         .map_err(|error| format!("invalid pending Last.fm writes: {error}"))?;
+    // Track caching does not need a library membership snapshot. Process tracks
+    // first so a missing artist-membership database cannot discard them.
+    writes.sort_by_key(|(_, response)| matches!(response, FetchResponse::Artist(_)));
     let now = unix_seconds() as i64;
     let mut store = GraphStore::open_at(&options.store_path, now)?;
     let mut cache = crate::legacy_cache::CacheUsage::new(options.legacy_cache_path.as_deref());
-    let library = if options.storage_scope == StorageScope::LocalArtistsOnly {
-        Some(crate::library_membership::LocalLibrary::load(
-            std::path::Path::new(
-                options
-                    .library_db_path
-                    .as_deref()
-                    .ok_or("Lyrion library database is unavailable")?,
-            ),
-        )?)
+    let loaded_library = if options.storage_scope == StorageScope::LocalArtistsOnly
+        && shared_library.is_none()
+        && writes
+            .iter()
+            .any(|(_, response)| matches!(response, FetchResponse::Artist(_)))
+    {
+        options
+            .library_db_path
+            .as_deref()
+            .ok_or_else(|| "Lyrion library database is unavailable".to_owned())
+            .and_then(|path| {
+                crate::library_membership::LocalLibrary::load(std::path::Path::new(path))
+            })
+            .map(Some)
     } else {
-        None
+        Ok(None)
     };
+    let library: Result<Option<&crate::library_membership::LocalLibrary>, String> =
+        match shared_library {
+            Some(value) => Ok(Some(value)),
+            None => loaded_library
+                .as_ref()
+                .map(|value| value.as_ref())
+                .map_err(Clone::clone),
+        };
     let mut reports = Vec::new();
     for (mut task, response) in writes {
         match &response {
             FetchResponse::Artist(_) => {
+                if let Err(error) = &library {
+                    if budget_already_locked {
+                        return Err(error.clone());
+                    }
+                    let item =
+                        serde_json::to_value((&task, &response)).map_err(|e| e.to_string())?;
+                    let stored = crate::deferred_queue::enqueue_artist(
+                        std::path::Path::new(&options.store_path),
+                        options.legacy_cache_path.as_deref(),
+                        &item,
+                        options.budget_bytes,
+                        now,
+                    )?;
+                    if !stored {
+                        return Err(
+                            "Last.fm deferred artist result exceeded the configured storage limit"
+                                .into(),
+                        );
+                    }
+                    reports.push(serde_json::json!({"event":"artist_deferred", "artist": task.source()["label"]}));
+                    continue;
+                }
+                let library = *library.as_ref().map_err(Clone::clone)?;
+                let _budget = if budget_already_locked {
+                    None
+                } else {
+                    Some(crate::storage_budget::BudgetLock::acquire(
+                        std::path::Path::new(&options.store_path),
+                    )?)
+                };
+                let queued =
+                    crate::deferred_queue::queued_bytes(std::path::Path::new(&options.store_path))?
+                        .saturating_sub(transferring_bytes);
                 if let FetchTask::Artist {
                     source_id,
                     artist,
@@ -1022,8 +1097,13 @@ pub fn persist_pending_writes(
                     &response,
                     now,
                     options.storage_scope,
-                    library.as_ref(),
-                    Some(options.budget_bytes.saturating_sub(cache.bytes(now)?)),
+                    library,
+                    Some(
+                        options
+                            .budget_bytes
+                            .saturating_sub(cache.bytes(now)?)
+                            .saturating_sub(queued),
+                    ),
                 )?;
                 if !stored {
                     return Err(
@@ -1035,7 +1115,7 @@ pub fn persist_pending_writes(
                         source_id, artist, ..
                     },
                     Some(library),
-                ) = (&task, &library)
+                ) = (&task, library)
                 {
                     if let FetchResponse::Artist(value) = &response {
                         if value.status == ResponseStatus::Modified {
@@ -1063,6 +1143,12 @@ pub fn persist_pending_writes(
             }
             FetchResponse::Track(value) => {
                 if let Some(path) = options.legacy_cache_path.as_deref() {
+                    let _budget = crate::storage_budget::BudgetLock::acquire(
+                        std::path::Path::new(&options.store_path),
+                    )?;
+                    let queued = crate::deferred_queue::queued_bytes(std::path::Path::new(
+                        &options.store_path,
+                    ))?;
                     let stored = crate::legacy_cache::cache_tracks_with_budget(
                         path,
                         task.key(),
@@ -1070,7 +1156,8 @@ pub fn persist_pending_writes(
                         &value.results,
                         options
                             .budget_bytes
-                            .saturating_sub(store.retained_lastfm_bytes()?),
+                            .saturating_sub(store.retained_lastfm_bytes()?)
+                            .saturating_sub(queued),
                     )?;
                     if !stored {
                         return Err(
@@ -1080,6 +1167,63 @@ pub fn persist_pending_writes(
                 }
             }
         }
+    }
+    Ok(reports)
+}
+
+/// Drain only after the host has resolved a currently usable library path.
+/// A queued item remains durable on any validation or persistence failure.
+pub fn drain_queued_artists(options: &DirectOptions) -> Result<Vec<Value>, String> {
+    let graph = std::path::Path::new(&options.store_path);
+    let library = if options.storage_scope == StorageScope::LocalArtistsOnly {
+        let path = options
+            .library_db_path
+            .as_deref()
+            .ok_or("Lyrion library database is unavailable")?;
+        Some(crate::library_membership::LocalLibrary::load(
+            std::path::Path::new(path),
+        )?)
+    } else {
+        None
+    };
+    let mut reports = Vec::new();
+    loop {
+        let _budget = crate::storage_budget::BudgetLock::acquire(graph)?;
+        let Some(path) = crate::deferred_queue::entries_locked(graph)?
+            .into_iter()
+            .next()
+        else {
+            break;
+        };
+        let (mut value, size) = crate::deferred_queue::read_entry_locked(&path)?;
+        let limit = options.artist_result_limit.value();
+        if limit != 0 && value[1]["Artist"]["status"] == "Modified" {
+            if let Some(results) = value[1]["Artist"]["results"].as_array_mut() {
+                results.truncate(limit as usize);
+            }
+            if let Some(previous) = value[1]["Artist"]["requested_limit"].as_u64() {
+                if previous == 0 || previous > u64::from(limit) {
+                    value[1]["Artist"]["requested_limit"] = serde_json::json!(limit);
+                }
+            }
+        }
+        let artist_name = value[0]["Artist"]["artist"]
+            .as_str()
+            .unwrap_or("")
+            .to_owned();
+        let mut item_reports = persist_pending_writes_inner(
+            options,
+            serde_json::json!([value]),
+            true,
+            size,
+            library.as_ref(),
+        )?;
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("cannot remove persisted Last.fm queue entry: {e}"))?;
+        if item_reports.is_empty() {
+            item_reports.push(serde_json::json!({"event":"artist_drained", "artist":artist_name}));
+        }
+        reports.append(&mut item_reports);
     }
     Ok(reports)
 }
